@@ -201,7 +201,7 @@ The health server also exposes Prometheus metrics at `/metrics`. It binds to `--
 | `extractedprism_upstreams_total` | Gauge | | Total known upstreams, including unhealthy and draining |
 | `extractedprism_connections_active` | Gauge | | TCP connections currently passing through the proxy |
 | `extractedprism_connections_total` | Counter | | Connections established to upstreams since start |
-| `extractedprism_connection_errors_total` | Counter | `upstream` | Failed connection attempts (`none` when no upstream was available) |
+| `extractedprism_connection_errors_total` | Counter | `upstream` | Failed connection attempts (`none` when no upstream was available); failures caused by proxy shutdown are not counted |
 | `extractedprism_discovery_updates_total` | Counter | `provider` | Endpoint list updates received (`static`, `kubernetes`) |
 | `extractedprism_discovery_errors_total` | Counter | `provider` | Discovery errors: provider failures, failed Watch calls, watch error events and failed re-lists. A watch stream ending is not counted, including on a dropped connection, and neither is 410 Gone expiry; a dead upstream shows in `health_check_status` instead |
 | `extractedprism_health_check_status` | Gauge | `upstream` | Upstream health state after the consecutive-failure threshold, fed by health checks and client dials (1 healthy, 0 unhealthy). Health checks stop while an upstream drains, so the value holds until it is removed or re-added |

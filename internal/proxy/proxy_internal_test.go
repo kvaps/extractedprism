@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/lexfrei/extractedprism/internal/metrics"
 )
@@ -306,4 +307,71 @@ func TestOnHealthChange_WritesCurrentStateNotArgument(t *testing.T) {
 
 	body := scrapeInternal(t, prx.metrics)
 	assert.Contains(t, body, `extractedprism_health_check_status{upstream="192.0.2.1:6443"} 1`)
+}
+
+func TestHandleConn_DialAbortedByShutdown_NotCountedAsConnError(t *testing.T) {
+	core, logs := observer.New(zap.InfoLevel)
+	prx := New(Config{DialTimeout: time.Second, HealthInterval: time.Hour}, zap.New(core), metrics.New())
+
+	bck := newTestBackend("127.0.0.1:6443")
+	prx.backends[bck.addr] = bck
+
+	prx.cancel()
+
+	client, peer := net.Pipe()
+	t.Cleanup(func() { peer.Close() })
+
+	prx.wg.Add(1)
+	prx.handleConn(client)
+
+	body := scrapeInternal(t, prx.metrics)
+	assert.NotContains(t, body, "extractedprism_connection_errors_total{",
+		"a dial aborted by shutdown says nothing about the upstream")
+	assert.Zero(t, logs.FilterMessage("upstream dial failed").Len(),
+		"a dial aborted by shutdown must not be logged as an upstream failure")
+}
+
+func TestServeConn_RefusedByShutdown_NotCountedAsConnError(t *testing.T) {
+	prx := newTestProxy(t)
+	bck := newTestBackend("192.0.2.1:6443")
+	prx.backends[bck.addr] = bck
+
+	// The dial completed, then shutdown began before registration.
+	prx.cancel()
+
+	client, clientPeer := net.Pipe()
+	upstream, upstreamPeer := net.Pipe()
+
+	t.Cleanup(func() {
+		clientPeer.Close()
+		upstreamPeer.Close()
+	})
+
+	prx.serveConn(bck, &trackedConn{client: client, upstream: upstream})
+
+	body := scrapeInternal(t, prx.metrics)
+	assert.NotContains(t, body, "extractedprism_connection_errors_total{",
+		"a connection refused at registration by shutdown is not an upstream error")
+}
+
+func TestServeConn_RefusedByDrain_CountedAsConnError(t *testing.T) {
+	prx := newTestProxy(t)
+	bck := newTestBackend("192.0.2.1:6443")
+	prx.backends[bck.addr] = bck
+
+	bck.startDrain()
+
+	client, clientPeer := net.Pipe()
+	upstream, upstreamPeer := net.Pipe()
+
+	t.Cleanup(func() {
+		clientPeer.Close()
+		upstreamPeer.Close()
+	})
+
+	prx.serveConn(bck, &trackedConn{client: client, upstream: upstream})
+
+	body := scrapeInternal(t, prx.metrics)
+	assert.Contains(t, body, `extractedprism_connection_errors_total{upstream="192.0.2.1:6443"} 1`,
+		"outside shutdown a refused registration still fails the client connection")
 }
