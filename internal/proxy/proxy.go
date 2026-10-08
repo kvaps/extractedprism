@@ -524,16 +524,30 @@ func (prx *Proxy) handleConn(client net.Conn) {
 
 	prx.tuneClientConn(client)
 
+	bck := prx.pickOrClose(client)
+	if bck == nil {
+		return
+	}
+
+	prx.dialAndServe(client, bck, true)
+}
+
+// pickOrClose returns a pickable backend, or closes the client and returns
+// nil when there is none.
+func (prx *Proxy) pickOrClose(client net.Conn) *backend {
 	bck := prx.pickBackend()
 	if bck == nil {
 		prx.metrics.ConnError(noUpstreamLabel)
 		prx.logger.Warn("no pickable upstream, closing connection",
 			zap.String("client", client.RemoteAddr().String()))
 		client.Close()
-
-		return
 	}
 
+	return bck
+}
+
+// mayRetry allows one more pick when the backend starts draining mid-dial.
+func (prx *Proxy) dialAndServe(client net.Conn, bck *backend, mayRetry bool) {
 	upstream, err := prx.dialUpstream(bck.addr)
 	if err != nil {
 		client.Close()
@@ -553,16 +567,24 @@ func (prx *Proxy) handleConn(client net.Conn) {
 
 	prx.recordSuccess(bck)
 
-	prx.serveConn(bck, &trackedConn{client: client, upstream: upstream})
+	prx.serveConn(bck, &trackedConn{client: client, upstream: upstream}, mayRetry)
 }
 
 // serveConn registers a dialed connection with its backend and relays it
 // until both directions end.
-func (prx *Proxy) serveConn(bck *backend, tconn *trackedConn) {
+func (prx *Proxy) serveConn(bck *backend, tconn *trackedConn, mayRetry bool) {
 	// A connection dialed while its backend was being removed must not enter
 	// service: the drain bookkeeping may already be complete, and the
 	// connection would escape both force-close and shutdown accounting.
 	if !prx.tryRegister(bck, tconn) {
+		// Outside shutdown the refusal means the backend started draining
+		// mid-dial: the client is still good for another backend.
+		if prx.ctx.Err() == nil && mayRetry {
+			prx.retry(bck, tconn)
+
+			return
+		}
+
 		tconn.close()
 
 		if prx.ctx.Err() == nil {
@@ -578,6 +600,22 @@ func (prx *Proxy) serveConn(bck *backend, tconn *trackedConn) {
 
 	prx.metrics.ConnClosed()
 	bck.unregister(tconn)
+}
+
+// retry drops the unregistered upstream side of a refused connection and
+// serves the client from one more pick, without further retries.
+func (prx *Proxy) retry(refused *backend, tconn *trackedConn) {
+	tconn.upstream.Close()
+
+	prx.logger.Info("upstream started draining during dial, retrying",
+		zap.String("upstream", refused.addr))
+
+	bck := prx.pickOrClose(tconn.client)
+	if bck == nil {
+		return
+	}
+
+	prx.dialAndServe(tconn.client, bck, false)
 }
 
 // connError records a failed connection while its address is in the set. The
