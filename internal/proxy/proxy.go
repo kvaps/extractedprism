@@ -536,25 +536,38 @@ func (prx *Proxy) handleConn(client net.Conn) {
 
 	upstream, err := prx.dialUpstream(bck.addr)
 	if err != nil {
+		client.Close()
+
+		// A dial failing during shutdown says nothing about the upstream.
+		if prx.ctx.Err() != nil {
+			return
+		}
+
 		prx.recordFailure(bck, err)
 		prx.metrics.ConnError(bck.addr)
 		prx.logger.Warn("upstream dial failed",
 			zap.String("upstream", bck.addr), zap.Error(err))
-		client.Close()
 
 		return
 	}
 
 	prx.recordSuccess(bck)
 
-	tconn := &trackedConn{client: client, upstream: upstream}
+	prx.serveConn(bck, &trackedConn{client: client, upstream: upstream})
+}
 
+// serveConn registers a dialed connection with its backend and relays it
+// until both directions end.
+func (prx *Proxy) serveConn(bck *backend, tconn *trackedConn) {
 	// A connection dialed while its backend was being removed must not enter
 	// service: the drain bookkeeping may already be complete, and the
 	// connection would escape both force-close and shutdown accounting.
 	if !prx.tryRegister(bck, tconn) {
-		prx.metrics.ConnError(bck.addr)
 		tconn.close()
+
+		if prx.ctx.Err() == nil {
+			prx.metrics.ConnError(bck.addr)
+		}
 
 		return
 	}

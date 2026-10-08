@@ -48,7 +48,7 @@ func New() *Metrics {
 		connErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "connection_errors_total",
-			Help:      "Connection errors by upstream, or \"none\" when no upstream was available.",
+			Help:      "Connection errors by upstream, or \"none\" when no upstream was available. Failures caused by proxy shutdown are not counted.",
 		}, []string{labelUpstream}),
 		discoveryUpdates: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
