@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
@@ -36,6 +37,7 @@ type rewatchHarness struct {
 	noBookmarks atomic.Bool
 	// failLists makes every List call after it is set fail.
 	failLists atomic.Bool
+	lists     atomic.Int32
 	cancel    context.CancelFunc
 	errCh     chan error
 	logs      *observer.ObservedLogs
@@ -62,6 +64,18 @@ func (w *announcingWatcher) ResultChan() <-chan watch.Event {
 func startRewatchHarness(t *testing.T, failedWatchCalls ...time.Duration) *rewatchHarness {
 	t.Helper()
 
+	return startRewatchHarnessWithWatchError(t, errSimulatedWatchFailure, failedWatchCalls...)
+}
+
+// startRewatchHarnessWithWatchError is startRewatchHarness with the error the
+// failing Watch calls return.
+func startRewatchHarnessWithWatchError(
+	t *testing.T,
+	watchCallErr error,
+	failedWatchCalls ...time.Duration,
+) *rewatchHarness {
+	t.Helper()
+
 	harness := &rewatchHarness{
 		watchers: make(chan *watch.FakeWatcher, 10),
 		backoffs: make(chan int),
@@ -74,6 +88,8 @@ func startRewatchHarness(t *testing.T, failedWatchCalls ...time.Duration) *rewat
 
 	client.PrependReactor("list", "endpointslices",
 		func(_ k8stesting.Action) (bool, runtime.Object, error) {
+			harness.lists.Add(1)
+
 			if harness.failLists.Load() {
 				return true, nil, errSimulatedListFailure
 			}
@@ -95,7 +111,7 @@ func startRewatchHarness(t *testing.T, failedWatchCalls ...time.Duration) *rewat
 			if call <= len(failedWatchCalls) {
 				harness.advance(failedWatchCalls[call-1])
 
-				return true, nil, errSimulatedWatchFailure
+				return true, nil, watchCallErr
 			}
 
 			watcher := watch.NewFake()
@@ -376,4 +392,36 @@ func TestRun_GoneOnShortLivedWatches_BacksOffBetweenRelists(t *testing.T) {
 
 	harness.nextWatcher(t).Error(goneStatus())
 	assert.Equal(t, 2, harness.nextBackoff(t))
+}
+
+func TestRun_GoneOnWatchCall_Relists(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "resource expired", err: apierrors.NewResourceExpired("too old resource version")},
+		{
+			// What older servers send for a stale version.
+			name: "gone",
+			err: &apierrors.StatusError{ErrStatus: metav1.Status{
+				Status:  metav1.StatusFailure,
+				Code:    410,
+				Reason:  metav1.StatusReasonGone,
+				Message: "too old resource version",
+			}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			harness := startRewatchHarnessWithWatchError(t, tt.err, 0)
+			defer harness.stop(t)
+
+			// The re-list runs before the backoff wait, so the count is final
+			// once the wait is reached.
+			assert.Equal(t, 1, harness.nextBackoff(t))
+			assert.Equal(t, int32(2), harness.lists.Load(),
+				"a 410 returned by the Watch call itself must trigger a re-list")
+		})
+	}
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
@@ -288,6 +289,12 @@ func (p *Provider) watchOnce(
 		},
 	)
 	if err != nil {
+		// A server can refuse a stale resource version on the Watch call
+		// itself instead of in the stream; both need the same re-list.
+		if apierrors.IsResourceExpired(err) || apierrors.IsGone(err) {
+			return 0, errGone
+		}
+
 		return 0, errors.Wrap(err, "watch endpoint slices")
 	}
 
