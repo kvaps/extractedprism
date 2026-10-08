@@ -1717,8 +1717,8 @@ func TestRun_ServerClosedWatch_NotReportedToErrorHook(t *testing.T) {
 	initial := makeEndpointSlice("10.0.0.1")
 	client := fake.NewClientset(initial)
 
-	// The API server ends every watch after its own timeout. Later watches
-	// get a fresh, quiet stream, as a real server would open.
+	// The first stream ends at once and takes the backoff path. Later
+	// watches get a fresh, quiet stream, as a real server would open.
 	fakeWatcher := watch.NewFake()
 
 	var watchCalls atomic.Int32

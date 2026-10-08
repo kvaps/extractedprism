@@ -26,6 +26,11 @@ const (
 	backoffMax             = 30 * time.Second
 	backoffFactor          = 2.0
 	backoffJitterFrac      = 0.25
+
+	// minHealthyWatch is how long a watch must stay open to count as healthy.
+	// Equal to backoffMax, so immediate re-watches after healthy streams never
+	// open watches faster than the backoff ceiling already allows.
+	minHealthyWatch = backoffMax
 )
 
 // Compile-time interface check.
@@ -39,6 +44,8 @@ type Provider struct {
 	knownSlices  map[string][]discoveryv1.Endpoint
 	hadEndpoints bool
 	onError      func()
+	now          func() time.Time
+	backoff      func(attempt int) time.Duration
 }
 
 // NewProvider creates a Kubernetes discovery provider.
@@ -49,6 +56,8 @@ func NewProvider(client kubernetes.Interface, logger *zap.Logger, apiPort string
 		apiPort:     apiPort,
 		knownSlices: make(map[string][]discoveryv1.Endpoint),
 		onError:     func() {},
+		now:         time.Now,
+		backoff:     BackoffDelay,
 	}
 
 	for _, opt := range opts {
@@ -121,30 +130,27 @@ func (p *Provider) watchLoop(
 	attempt := 0
 
 	for ctx.Err() == nil {
-		watchErr := p.watchOnce(ctx, updateCh, &resVer)
+		lifetime, watchErr := p.watchOnce(ctx, updateCh, &resVer)
 
 		if ctx.Err() != nil {
 			return nil //nolint:nilerr // context cancellation is graceful exit, watchErr is irrelevant
 		}
 
-		if watchErr == nil {
+		// A watch that stayed open long enough proves the upstream healthy, so
+		// a failure after it starts the backoff over.
+		if lifetime >= minHealthyWatch {
 			attempt = 0
 
-			continue
+			// The server ends every watch after its own timeout. Re-watching at
+			// once is safe here: a stream that ends early takes the backoff path.
+			if errors.Is(watchErr, errWatchClosed) {
+				p.logger.Debug("watch stream ended, re-watching", zap.Duration("lifetime", lifetime))
+
+				continue
+			}
 		}
 
 		attempt++
-
-		// Server-side stream ends and 410 Gone (etcd compaction, handled by a
-		// re-list) are routine on long-lived watches; counting them would grow
-		// the error metric on a healthy cluster. A failed re-list is still
-		// reported below.
-		if !errors.Is(watchErr, errGone) && !errors.Is(watchErr, errWatchClosed) {
-			p.onError()
-		}
-
-		p.logger.Warn("watch error, restarting with backoff",
-			zap.Error(watchErr), zap.Int("attempt", attempt))
 
 		if errors.Is(watchErr, errGone) {
 			if p.handleGoneRelist(ctx, updateCh, &resVer) {
@@ -152,25 +158,40 @@ func (p *Provider) watchLoop(
 
 				continue
 			}
-
-			if ctx.Err() != nil {
-				return nil //nolint:nilerr // context cancellation is graceful exit, watchErr is irrelevant
-			}
+		} else {
+			p.reportWatchError(watchErr, attempt)
 		}
 
-		delay := BackoffDelay(attempt)
-		timer := time.NewTimer(delay)
-
-		select {
-		case <-timer.C:
-		case <-ctx.Done():
-			timer.Stop()
-
+		if !p.waitBackoff(ctx, attempt) {
 			return nil
 		}
 	}
 
 	return nil
+}
+
+func (p *Provider) reportWatchError(watchErr error, attempt int) {
+	// Server-side stream ends are routine on long-lived watches; counting them
+	// would grow the error metric on a healthy cluster.
+	if !errors.Is(watchErr, errWatchClosed) {
+		p.onError()
+	}
+
+	p.logger.Warn("watch error, restarting with backoff",
+		zap.Error(watchErr), zap.Int("attempt", attempt))
+}
+
+// waitBackoff returns false if ctx ends before the backoff delay elapses.
+func (p *Provider) waitBackoff(ctx context.Context, attempt int) bool {
+	timer := time.NewTimer(p.backoff(attempt))
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // handleGoneRelist performs a full re-list when Watch returns 410 Gone.
@@ -238,24 +259,35 @@ func BackoffDelay(attempt int) time.Duration {
 	return time.Duration(delay + jitter)
 }
 
+// watchOnce returns how long the stream stayed open, counted from the moment
+// the Watch call returned it. A failed Watch call has a zero lifetime however
+// long it blocked, so it never counts as a healthy watch.
 func (p *Provider) watchOnce(
 	ctx context.Context,
 	updateCh chan<- []string,
 	resVer *string,
-) error {
+) (time.Duration, error) {
 	watcher, err := p.client.DiscoveryV1().EndpointSlices(endpointSliceNamespace).Watch(
 		ctx, metav1.ListOptions{
 			LabelSelector:   kubernetesServiceLabel,
 			ResourceVersion: *resVer,
+			// The kubernetes EndpointSlice rarely changes, so without bookmarks
+			// resVer goes stale and the re-watch after a routine stream end can
+			// get 410 Gone. Servers with the watch cache send a bookmark about
+			// once a minute and just before they end the watch.
+			AllowWatchBookmarks: true,
 		},
 	)
 	if err != nil {
-		return errors.Wrap(err, "watch endpoint slices")
+		return 0, errors.Wrap(err, "watch endpoint slices")
 	}
 
 	defer watcher.Stop()
 
-	return p.handleEvents(ctx, watcher, updateCh, resVer)
+	opened := p.now()
+	err = p.handleEvents(ctx, watcher, updateCh, resVer)
+
+	return p.now().Sub(opened), err
 }
 
 func (p *Provider) handleEvents(
