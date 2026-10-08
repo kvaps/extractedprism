@@ -19,6 +19,7 @@ const (
 	defaultLogLevel          = "info"
 	defaultLivenessInterval  = 5 * time.Second
 	defaultLivenessThreshold = 15 * time.Second
+	defaultDrainTimeout      = 30 * time.Second
 
 	minPort = 1
 	maxPort = 65535
@@ -37,6 +38,7 @@ var (
 	ErrInvalidLivenessDuration  = errors.New("invalid liveness duration")
 	ErrInvalidLivenessTiming    = errors.New("liveness threshold must be greater than liveness interval")
 	ErrInvalidHealthBindAddress = errors.New("invalid health bind address")
+	ErrInvalidDrainTimeout      = errors.New("drain timeout must not be negative")
 )
 
 const minDuration = 1 * time.Second
@@ -63,6 +65,9 @@ type Config struct {
 	LogLevel          string
 	LivenessInterval  time.Duration
 	LivenessThreshold time.Duration
+	// DrainTimeout bounds how long connections to a removed endpoint may
+	// finish before being force-closed. Zero closes them immediately.
+	DrainTimeout time.Duration
 }
 
 // NewBaseConfig returns a Config populated with sensible defaults for optional
@@ -79,6 +84,7 @@ func NewBaseConfig() *Config {
 		LogLevel:          defaultLogLevel,
 		LivenessInterval:  defaultLivenessInterval,
 		LivenessThreshold: defaultLivenessThreshold,
+		DrainTimeout:      defaultDrainTimeout,
 	}
 }
 
@@ -147,6 +153,10 @@ func (cfg *Config) Validate() error {
 
 	if cfg.LivenessThreshold <= cfg.LivenessInterval {
 		return ErrInvalidLivenessTiming
+	}
+
+	if cfg.DrainTimeout < 0 {
+		return errors.Wrapf(ErrInvalidDrainTimeout, "drain timeout %s", cfg.DrainTimeout)
 	}
 
 	return nil

@@ -755,3 +755,38 @@ func TestParseEndpoints(t *testing.T) {
 		})
 	}
 }
+
+func TestValidate_DrainTimeout(t *testing.T) {
+	tests := []struct {
+		name         string
+		drainTimeout time.Duration
+		wantErr      error
+	}{
+		{name: "negative returns ErrInvalidDrainTimeout", drainTimeout: -time.Second, wantErr: config.ErrInvalidDrainTimeout},
+		{name: "one nanosecond below zero returns ErrInvalidDrainTimeout", drainTimeout: -time.Nanosecond, wantErr: config.ErrInvalidDrainTimeout},
+		{name: "zero means immediate force close", drainTimeout: 0, wantErr: nil},
+		{name: "one nanosecond above zero is valid", drainTimeout: time.Nanosecond, wantErr: nil},
+		{name: "positive is valid", drainTimeout: 30 * time.Second, wantErr: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validTestConfig()
+			cfg.DrainTimeout = tt.drainTimeout
+
+			err := cfg.Validate()
+
+			if tt.wantErr == nil {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+				assert.True(t, errors.Is(err, tt.wantErr))
+			}
+		})
+	}
+}
+
+func TestNewBaseConfig_DrainTimeoutDefault(t *testing.T) {
+	cfg := config.NewBaseConfig()
+	assert.Equal(t, 30*time.Second, cfg.DrainTimeout)
+}
