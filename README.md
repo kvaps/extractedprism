@@ -157,6 +157,7 @@ All flags are bound to environment variables with the `EP_` prefix. For example,
 ## Examples
 
 - [Shared, SNI-routed control plane endpoint](examples/shared-sni-endpoint/) -- route kubelet through extractedprism to a shared endpoint that selects the backend by TLS SNI (for example nginx-ingress `ssl-passthrough`), using kubelet's `tls-server-name` while extractedprism stays a pure passthrough.
+- [Talos Linux static pod](examples/talos/) -- replace the built-in KubePrism with extractedprism on Talos Linux; the Kubernetes discovery registry KubePrism relies on is deprecated on Kubernetes 1.32+, leaving only the external `discovery.talos.dev`.
 
 ## How it works
 
