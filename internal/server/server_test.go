@@ -350,12 +350,10 @@ func TestRun_WithDiscoveryEnabled(t *testing.T) {
 	cfg.EnableDiscovery = true
 
 	eps := &discoveryv1.EndpointSlice{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "kubernetes",
-			Namespace: "default",
-			Labels: map[string]string{
-				"kubernetes.io/service-name": "kubernetes",
-			},
+		Name:      "kubernetes",
+		Namespace: "default",
+		Labels: map[string]string{
+			"kubernetes.io/service-name": "kubernetes",
 		},
 		Endpoints: []discoveryv1.Endpoint{
 			{Addresses: []string{"127.0.0.1"}},
@@ -407,8 +405,7 @@ func TestRunHealth_NilReturnDoesNotBlock(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	errCh := make(chan error, 1)
 
@@ -436,8 +433,7 @@ func TestRunHealth_StartErrorPropagates(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	errCh := make(chan error, 1)
 
@@ -628,8 +624,7 @@ func TestRun_DiscoveryErrorPropagates(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	errCh := make(chan error, 1)
 
@@ -842,11 +837,9 @@ func TestRun_RecoveredDiscoveryErrors_ReachMetrics(t *testing.T) {
 	cfg.EnableDiscovery = true
 
 	eps := &discoveryv1.EndpointSlice{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "kubernetes",
-			Namespace: "default",
-			Labels:    map[string]string{"kubernetes.io/service-name": "kubernetes"},
-		},
+		Name:      "kubernetes",
+		Namespace: "default",
+		Labels:    map[string]string{"kubernetes.io/service-name": "kubernetes"},
 		Endpoints: []discoveryv1.Endpoint{{Addresses: []string{"127.0.0.1"}}},
 	}
 
