@@ -1549,6 +1549,60 @@ func TestRun_RecoveredWatchError_ReportedToErrorHook(t *testing.T) {
 	waitForRun(t, errCh)
 }
 
+func TestRun_RelistCanceledByShutdown_NotReportedToErrorHook(t *testing.T) {
+	initial := makeEndpointSlice("10.0.0.1")
+	client := fake.NewClientset(initial)
+
+	fakeWatcher := watch.NewFake()
+	client.PrependWatchReactor("endpointslices", k8stesting.DefaultWatchReactor(fakeWatcher, nil))
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	var listCount atomic.Int32
+
+	// The re-list fails because the provider is shutting down, as a real
+	// client call does when its context is canceled mid-request.
+	client.PrependReactor("list", "endpointslices",
+		func(_ k8stesting.Action) (bool, runtime.Object, error) {
+			if listCount.Add(1) > 1 {
+				cancel()
+
+				return true, nil, context.Canceled
+			}
+
+			return false, nil, nil
+		},
+	)
+
+	var reported atomic.Int32
+
+	provider := kubediscovery.NewProvider(client, newTestLogger(), testAPIPort,
+		kubediscovery.WithErrorHook(func() { reported.Add(1) }))
+
+	updateCh := make(chan []string, 10)
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- provider.Run(ctx, updateCh)
+	}()
+
+	receiveEndpoints(t, updateCh)
+
+	fakeWatcher.Error(&metav1.Status{
+		Status: metav1.StatusFailure,
+		Code:   410,
+		Reason: metav1.StatusReasonGone,
+	})
+
+	// Run returns only after the failed re-list was handled, so the hook
+	// count is final here.
+	waitForRun(t, errCh)
+
+	require.Equal(t, int32(2), listCount.Load(), "the re-list must have run")
+	assert.Zero(t, reported.Load(), "a re-list canceled by shutdown is not a discovery error")
+}
+
 func TestRun_RelistFailure_ReportedToErrorHook(t *testing.T) {
 	initial := makeEndpointSlice("10.0.0.1")
 	client := fake.NewClientset(initial)

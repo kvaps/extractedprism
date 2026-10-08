@@ -187,9 +187,15 @@ func (p *Provider) handleGoneRelist(
 
 	endpoints, newVer, listErr := p.listEndpoints(ctx)
 	if listErr != nil {
+		p.knownSlices = oldSlices
+
+		// A re-list cut short by shutdown is not a discovery failure.
+		if ctx.Err() != nil {
+			return false
+		}
+
 		p.onError()
 		p.logger.Warn("re-list failed, retaining cached endpoints", zap.Error(listErr))
-		p.knownSlices = oldSlices
 
 		return false
 	}
