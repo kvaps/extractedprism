@@ -5,7 +5,6 @@ go 1.27.2
 require (
 	github.com/cockroachdb/errors v1.14.0
 	github.com/prometheus/client_golang v1.25.0
-	github.com/siderolabs/go-loadbalancer v0.5.0
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.10
 	github.com/spf13/viper v1.21.0
@@ -61,8 +60,6 @@ require (
 	github.com/prometheus/procfs v0.22.0 // indirect
 	github.com/rogpeppe/go-internal v1.15.0 // indirect
 	github.com/sagikazarmark/locafero v0.12.0 // indirect
-	github.com/siderolabs/gen v0.8.7 // indirect
-	github.com/siderolabs/tcpproxy v0.1.0 // indirect
 	github.com/spf13/afero v1.15.0 // indirect
 	github.com/spf13/cast v1.10.0 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect

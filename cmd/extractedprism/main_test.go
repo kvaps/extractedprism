@@ -2,6 +2,7 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
@@ -86,4 +87,15 @@ func setValidViperDefaults() {
 	viper.Set("log_level", "info")
 	viper.Set("liveness_interval", "5s")
 	viper.Set("liveness_threshold", "15s")
+}
+
+func TestBuildConfig_DrainTimeoutFromViper(t *testing.T) {
+	setValidViperDefaults()
+	t.Cleanup(viper.Reset)
+
+	viper.Set("drain_timeout", "7s")
+
+	cfg := buildConfig()
+	assert.Equal(t, 7*time.Second, cfg.DrainTimeout,
+		"DrainTimeout must be read from viper")
 }
