@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
@@ -33,9 +34,11 @@ type rewatchHarness struct {
 	reported atomic.Int32
 	// noBookmarks is set when any Watch call does not ask for bookmarks.
 	noBookmarks atomic.Bool
-	cancel      context.CancelFunc
-	errCh       chan error
-	logs        *observer.ObservedLogs
+	// failLists makes every List call after it is set fail.
+	failLists atomic.Bool
+	cancel    context.CancelFunc
+	errCh     chan error
+	logs      *observer.ObservedLogs
 }
 
 // announcingWatcher hands its fake to the test on the first ResultChan call,
@@ -68,6 +71,16 @@ func startRewatchHarness(t *testing.T, failedWatchCalls ...time.Duration) *rewat
 	}
 
 	client := fake.NewClientset(makeEndpointSlice("10.0.0.1"))
+
+	client.PrependReactor("list", "endpointslices",
+		func(_ k8stesting.Action) (bool, runtime.Object, error) {
+			if harness.failLists.Load() {
+				return true, nil, errSimulatedListFailure
+			}
+
+			return false, nil, nil
+		},
+	)
 
 	var watchCalls atomic.Int32
 
@@ -281,18 +294,26 @@ func TestRun_HealthyWatch_ResetsBackoffAttempt(t *testing.T) {
 		"an error after a healthy watch must restart the backoff from the first attempt")
 }
 
-func TestRun_GoneWithSuccessfulRelist_LogsNoWarning(t *testing.T) {
-	harness := startRewatchHarness(t)
-	defer harness.stop(t)
-
-	harness.nextWatcher(t).Error(&metav1.Status{
+func goneStatus() *metav1.Status {
+	return &metav1.Status{
 		Status: metav1.StatusFailure,
 		Code:   410,
 		Reason: metav1.StatusReasonExpired,
-	})
+	}
+}
 
-	harness.nextWatcher(t)
+func TestRun_GoneAfterHealthyWatch_RelistsAndRewatchesWithoutBackoff(t *testing.T) {
+	harness := startRewatchHarness(t)
+	defer harness.stop(t)
 
+	healthy := harness.nextWatcher(t)
+	harness.advance(kubediscovery.MinHealthyWatch)
+	healthy.Error(goneStatus())
+
+	harness.nextWatcher(t).Error(goneStatus())
+
+	assert.Equal(t, 1, harness.nextBackoff(t),
+		"a second 410 right after the quick re-list waits for the backoff")
 	assert.Zero(t, harness.logs.FilterLevelExact(zapcore.WarnLevel).Len(),
 		"410 Gone with a successful re-list is routine")
 }
@@ -311,4 +332,48 @@ func TestRun_Watch_RequestsBookmarks(t *testing.T) {
 	harness.nextWatcher(t)
 
 	assert.False(t, harness.noBookmarks.Load(), "every Watch call must request bookmarks")
+}
+
+func TestRun_GoneRightAfterHealthyStreamEnd_RelistsAndRewatchesWithoutBackoff(t *testing.T) {
+	// A re-watch after a routine stream end can carry a resource version the
+	// server has already forgotten. That one 410 is part of the routine end.
+	harness := startRewatchHarness(t)
+	defer harness.stop(t)
+
+	healthy := harness.nextWatcher(t)
+	harness.advance(kubediscovery.MinHealthyWatch)
+	healthy.Stop()
+
+	harness.nextWatcher(t).Error(goneStatus())
+	harness.nextWatcher(t).Error(goneStatus())
+
+	assert.Equal(t, 1, harness.nextBackoff(t),
+		"only the 410 right after a healthy stream skips the backoff")
+}
+
+func TestRun_GoneAfterHealthyWatch_FailedRelist_BacksOff(t *testing.T) {
+	harness := startRewatchHarness(t)
+	defer harness.stop(t)
+
+	healthy := harness.nextWatcher(t)
+	harness.advance(kubediscovery.MinHealthyWatch)
+	harness.failLists.Store(true)
+	healthy.Error(goneStatus())
+
+	assert.Equal(t, 1, harness.nextBackoff(t),
+		"a failed re-list keeps the stale version, so the next watch must wait")
+	assert.Equal(t, int32(1), harness.reported.Load(), "a failed re-list must reach the error hook")
+}
+
+func TestRun_GoneOnShortLivedWatches_BacksOffBetweenRelists(t *testing.T) {
+	// A server answering every fresh watch with 410 must not drive a
+	// list-and-watch loop without delay, even though every re-list succeeds.
+	harness := startRewatchHarness(t)
+	defer harness.stop(t)
+
+	harness.nextWatcher(t).Error(goneStatus())
+	require.Equal(t, 1, harness.nextBackoff(t))
+
+	harness.nextWatcher(t).Error(goneStatus())
+	assert.Equal(t, 2, harness.nextBackoff(t))
 }

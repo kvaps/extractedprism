@@ -128,9 +128,12 @@ func (p *Provider) watchLoop(
 ) error {
 	resVer := resourceVersion
 	attempt := 0
+	afterRoutineEnd := false
 
 	for ctx.Err() == nil {
 		lifetime, watchErr := p.watchOnce(ctx, updateCh, &resVer)
+		followsRoutineEnd := afterRoutineEnd
+		afterRoutineEnd = false
 
 		if ctx.Err() != nil {
 			return nil //nolint:nilerr // context cancellation is graceful exit, watchErr is irrelevant
@@ -146,6 +149,8 @@ func (p *Provider) watchLoop(
 			if errors.Is(watchErr, errWatchClosed) {
 				p.logger.Debug("watch stream ended, re-watching", zap.Duration("lifetime", lifetime))
 
+				afterRoutineEnd = true
+
 				continue
 			}
 		}
@@ -153,7 +158,11 @@ func (p *Provider) watchLoop(
 		attempt++
 
 		if errors.Is(watchErr, errGone) {
-			if p.handleGoneRelist(ctx, updateCh, &resVer) {
+			// A fresh re-list proves nothing about the watch that follows it.
+			// Only a 410 that ends a healthy watch, or hits the re-watch right
+			// after a routine end, skips the backoff: at most one quick re-list
+			// per healthy stream.
+			if p.handleGoneRelist(ctx, updateCh, &resVer) && (lifetime >= minHealthyWatch || followsRoutineEnd) {
 				attempt = 0
 
 				continue
@@ -195,7 +204,7 @@ func (p *Provider) waitBackoff(ctx context.Context, attempt int) bool {
 }
 
 // handleGoneRelist performs a full re-list when Watch returns 410 Gone.
-// Returns true if re-list succeeded and the caller should reset the attempt counter.
+// Returns true if the re-list succeeded.
 func (p *Provider) handleGoneRelist(
 	ctx context.Context,
 	updateCh chan<- []string,
