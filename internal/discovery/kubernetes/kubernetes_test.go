@@ -47,12 +47,10 @@ func makeNamedEndpointSlice(name string, ips ...string) *discoveryv1.EndpointSli
 	}
 
 	return &discoveryv1.EndpointSlice{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: "default",
-			Labels: map[string]string{
-				"kubernetes.io/service-name": "kubernetes",
-			},
+		Name:      name,
+		Namespace: "default",
+		Labels: map[string]string{
+			"kubernetes.io/service-name": "kubernetes",
 		},
 		Endpoints: endpoints,
 	}
@@ -67,12 +65,10 @@ func makeEndpointSlice(ips ...string) *discoveryv1.EndpointSlice {
 	}
 
 	return &discoveryv1.EndpointSlice{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "kubernetes",
-			Namespace: "default",
-			Labels: map[string]string{
-				"kubernetes.io/service-name": "kubernetes",
-			},
+		Name:      "kubernetes",
+		Namespace: "default",
+		Labels: map[string]string{
+			"kubernetes.io/service-name": "kubernetes",
 		},
 		Endpoints: endpoints,
 	}
@@ -231,12 +227,10 @@ func TestRun_WatchError(t *testing.T) {
 
 func TestRun_EmptyEndpoints(t *testing.T) {
 	eps := &discoveryv1.EndpointSlice{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "kubernetes",
-			Namespace: "default",
-			Labels: map[string]string{
-				"kubernetes.io/service-name": "kubernetes",
-			},
+		Name:      "kubernetes",
+		Namespace: "default",
+		Labels: map[string]string{
+			"kubernetes.io/service-name": "kubernetes",
 		},
 		Endpoints: []discoveryv1.Endpoint{},
 	}
@@ -263,12 +257,10 @@ func TestRun_EmptyEndpoints(t *testing.T) {
 
 func TestRun_MultipleEndpointObjects(t *testing.T) {
 	eps := &discoveryv1.EndpointSlice{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "kubernetes",
-			Namespace: "default",
-			Labels: map[string]string{
-				"kubernetes.io/service-name": "kubernetes",
-			},
+		Name:      "kubernetes",
+		Namespace: "default",
+		Labels: map[string]string{
+			"kubernetes.io/service-name": "kubernetes",
 		},
 		Endpoints: []discoveryv1.Endpoint{
 			{Addresses: []string{"10.0.0.1", "10.0.0.2"}},
@@ -536,12 +528,10 @@ func TestRun_MultiSliceDeletePreservesOtherSlices(t *testing.T) {
 
 func TestRun_FiltersNotReadyEndpoints(t *testing.T) {
 	eps := &discoveryv1.EndpointSlice{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "kubernetes",
-			Namespace: "default",
-			Labels: map[string]string{
-				"kubernetes.io/service-name": "kubernetes",
-			},
+		Name:      "kubernetes",
+		Namespace: "default",
+		Labels: map[string]string{
+			"kubernetes.io/service-name": "kubernetes",
 		},
 		Endpoints: []discoveryv1.Endpoint{
 			{
@@ -581,12 +571,10 @@ func TestRun_FiltersNotReadyEndpoints(t *testing.T) {
 
 func TestRun_AllEndpointsNotReady(t *testing.T) {
 	eps := &discoveryv1.EndpointSlice{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "kubernetes",
-			Namespace: "default",
-			Labels: map[string]string{
-				"kubernetes.io/service-name": "kubernetes",
-			},
+		Name:      "kubernetes",
+		Namespace: "default",
+		Labels: map[string]string{
+			"kubernetes.io/service-name": "kubernetes",
 		},
 		Endpoints: []discoveryv1.Endpoint{
 			{
@@ -853,13 +841,11 @@ func TestRun_WatchUpdateFiltersNotReady(t *testing.T) {
 
 	// Modify: mark 10.0.0.2 as not-ready.
 	updated := &discoveryv1.EndpointSlice{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            "kubernetes",
-			Namespace:       "default",
-			ResourceVersion: "2",
-			Labels: map[string]string{
-				"kubernetes.io/service-name": "kubernetes",
-			},
+		Name:            "kubernetes",
+		Namespace:       "default",
+		ResourceVersion: "2",
+		Labels: map[string]string{
+			"kubernetes.io/service-name": "kubernetes",
 		},
 		Endpoints: []discoveryv1.Endpoint{
 			{
@@ -1219,13 +1205,11 @@ func TestRun_UpdateToAllNotReadyLogsWarning(t *testing.T) {
 
 	// Update the slice: mark all endpoints as not-ready.
 	updated := &discoveryv1.EndpointSlice{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            "kubernetes",
-			Namespace:       "default",
-			ResourceVersion: "2",
-			Labels: map[string]string{
-				"kubernetes.io/service-name": "kubernetes",
-			},
+		Name:            "kubernetes",
+		Namespace:       "default",
+		ResourceVersion: "2",
+		Labels: map[string]string{
+			"kubernetes.io/service-name": "kubernetes",
 		},
 		Endpoints: []discoveryv1.Endpoint{
 			{

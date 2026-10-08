@@ -27,10 +27,8 @@ func TestApplyLBOverride_SetsHostAndServerName(t *testing.T) {
 
 func TestApplyLBOverride_PreservesExistingTLSFields(t *testing.T) {
 	restCfg := &rest.Config{
-		Host: "https://10.96.0.1:443",
-		TLSClientConfig: rest.TLSClientConfig{
-			CAFile: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
-		},
+		Host:   "https://10.96.0.1:443",
+		CAFile: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
 	}
 
 	applyLBOverride(restCfg, "127.0.0.1:7445")
