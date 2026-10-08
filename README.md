@@ -171,7 +171,7 @@ The TCP load balancer is implemented in `internal/proxy`. It accepts a channel o
 
 ### Graceful draining
 
-When an endpoint disappears from the upstream list (node cordon, API server rolling restart), the proxy stops routing new connections to it but lets existing connections finish within `--drain-timeout`. Remaining connections are force-closed when the timeout expires. Re-adding the endpoint before the timeout aborts the drain. A timeout of `0` closes connections to removed endpoints immediately.
+When an endpoint disappears from the upstream list (node cordon, API server rolling restart), the proxy stops routing new connections to it but lets existing connections finish within `--drain-timeout`. Remaining connections are force-closed when the timeout expires. Re-adding the endpoint before the timeout aborts the drain. A timeout of `0` closes connections to removed endpoints immediately. A new connection whose endpoint starts draining while it is being dialed gets one retry on another pickable endpoint, if there is one.
 
 ### Endpoint discovery
 

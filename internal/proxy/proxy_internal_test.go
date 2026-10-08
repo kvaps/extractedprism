@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -347,14 +348,14 @@ func TestServeConn_RefusedByShutdown_NotCountedAsConnError(t *testing.T) {
 		upstreamPeer.Close()
 	})
 
-	prx.serveConn(bck, &trackedConn{client: client, upstream: upstream})
+	prx.serveConn(bck, &trackedConn{client: client, upstream: upstream}, true)
 
 	body := scrapeInternal(t, prx.metrics)
 	assert.NotContains(t, body, "extractedprism_connection_errors_total{",
 		"a connection refused at registration by shutdown is not an upstream error")
 }
 
-func TestServeConn_RefusedByDrain_CountedAsConnError(t *testing.T) {
+func TestServeConn_RefusedByDrain_RetryExhausted_CountedAsConnError(t *testing.T) {
 	prx := newTestProxy(t)
 	bck := newTestBackend("192.0.2.1:6443")
 	prx.backends[bck.addr] = bck
@@ -369,7 +370,7 @@ func TestServeConn_RefusedByDrain_CountedAsConnError(t *testing.T) {
 		upstreamPeer.Close()
 	})
 
-	prx.serveConn(bck, &trackedConn{client: client, upstream: upstream})
+	prx.serveConn(bck, &trackedConn{client: client, upstream: upstream}, false)
 
 	body := scrapeInternal(t, prx.metrics)
 	assert.Contains(t, body, `extractedprism_connection_errors_total{upstream="192.0.2.1:6443"} 1`,
@@ -407,7 +408,7 @@ func TestServeConn_RefusedAfterRemoval_DoesNotRecreateConnErrorSeries(t *testing
 		upstreamPeer.Close()
 	})
 
-	prx.serveConn(bck, &trackedConn{client: client, upstream: upstream})
+	prx.serveConn(bck, &trackedConn{client: client, upstream: upstream}, false)
 
 	body := scrapeInternal(t, prx.metrics)
 	assert.NotContains(t, body, "extractedprism_connection_errors_total{",
@@ -433,9 +434,258 @@ func TestServeConn_RefusedAfterReAdd_CountsOnLiveSeries(t *testing.T) {
 		upstreamPeer.Close()
 	})
 
-	prx.serveConn(stale, &trackedConn{client: client, upstream: upstream})
+	prx.serveConn(stale, &trackedConn{client: client, upstream: upstream}, false)
 
 	body := scrapeInternal(t, prx.metrics)
 	assert.Contains(t, body, `extractedprism_connection_errors_total{upstream="192.0.2.1:6443"} 1`,
 		"the address is back in the set, so its series is live and the failure counts")
+}
+
+// startEchoBackend counts accepts so a test can prove which backends the
+// proxy dialed.
+func startEchoBackend(t *testing.T) (string, *atomic.Int32) {
+	t.Helper()
+
+	listener, err := new(net.ListenConfig).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { listener.Close() })
+
+	accepts := new(atomic.Int32)
+
+	go func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+
+			accepts.Add(1)
+
+			go func() {
+				defer conn.Close()
+
+				_, _ = io.Copy(conn, conn)
+			}()
+		}
+	}()
+
+	return listener.Addr().String(), accepts
+}
+
+// requireNoEarlierAccept dials the backend once more and waits for that probe
+// to be accepted: accepts are served in order, so a count of exactly one
+// proves no connection reached the backend before the probe.
+func requireNoEarlierAccept(t *testing.T, addr string, accepts *atomic.Int32) {
+	t.Helper()
+
+	probe, err := new(net.Dialer).DialContext(t.Context(), "tcp", addr)
+	require.NoError(t, err)
+	t.Cleanup(func() { probe.Close() })
+
+	require.Eventually(t, func() bool { return accepts.Load() >= 1 }, 3*time.Second, 10*time.Millisecond)
+	assert.Equal(t, int32(1), accepts.Load(), "the proxy must not have dialed this backend")
+}
+
+func deadAddr(t *testing.T) string {
+	t.Helper()
+
+	listener, err := new(net.ListenConfig).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	addr := listener.Addr().String()
+	listener.Close()
+
+	return addr
+}
+
+func newObservedProxy() (*Proxy, *observer.ObservedLogs) {
+	core, logs := observer.New(zap.InfoLevel)
+
+	return New(Config{DialTimeout: time.Second, HealthInterval: time.Hour}, zap.New(core), metrics.New()), logs
+}
+
+func TestServeConn_RefusedByDrain_RetriesAnotherBackend(t *testing.T) {
+	prx, logs := newObservedProxy()
+
+	addrB, _ := startEchoBackend(t)
+	bckB := newTestBackend(addrB)
+	prx.backends[addrB] = bckB
+
+	// A was picked and dialed, then started draining before registration.
+	bckA := newTestBackend("192.0.2.1:6443")
+	prx.backends[bckA.addr] = bckA
+	bckA.startDrain()
+
+	client, clientPeer := net.Pipe()
+	upstreamA, upstreamAPeer := net.Pipe()
+
+	require.NoError(t, clientPeer.SetDeadline(time.Now().Add(3*time.Second)))
+	require.NoError(t, upstreamAPeer.SetDeadline(time.Now().Add(3*time.Second)))
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		prx.serveConn(bckA, &trackedConn{client: client, upstream: upstreamA}, true)
+	}()
+
+	t.Cleanup(func() {
+		clientPeer.Close()
+		upstreamAPeer.Close()
+		<-done
+	})
+
+	_, err := clientPeer.Write([]byte("ping"))
+	require.NoError(t, err, "the client must stay open across the retry")
+
+	reply := make([]byte, 4)
+	_, err = io.ReadFull(clientPeer, reply)
+	require.NoError(t, err, "the client must be served by the retried backend")
+	assert.Equal(t, "ping", string(reply))
+
+	_, err = upstreamAPeer.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF, "the connection dialed to the draining backend must be closed")
+
+	assert.Equal(t, 1, logs.FilterMessage("upstream started draining during dial, retrying").Len())
+	assert.NotContains(t, scrapeInternal(t, prx.metrics), "extractedprism_connection_errors_total{",
+		"a refusal that was retried did not fail the client")
+}
+
+func TestServeConn_RefusedByDrain_NoPickableForRetry_ClosesClient(t *testing.T) {
+	prx := newTestProxy(t)
+	bck := newTestBackend("192.0.2.1:6443")
+	prx.backends[bck.addr] = bck
+	bck.startDrain()
+
+	client, clientPeer := net.Pipe()
+	upstream, upstreamPeer := net.Pipe()
+
+	t.Cleanup(func() {
+		clientPeer.Close()
+		upstreamPeer.Close()
+	})
+
+	prx.serveConn(bck, &trackedConn{client: client, upstream: upstream}, true)
+
+	_, err := clientPeer.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF, "with nothing left to pick, the client is closed")
+
+	body := scrapeInternal(t, prx.metrics)
+	assert.Contains(t, body, `extractedprism_connection_errors_total{upstream="none"} 1`)
+	assert.NotContains(t, body, `extractedprism_connection_errors_total{upstream="192.0.2.1:6443"}`)
+}
+
+func TestServeConn_RefusedByShutdown_DoesNotRetry(t *testing.T) {
+	prx, logs := newObservedProxy()
+
+	addrB, acceptsB := startEchoBackend(t)
+	prx.backends[addrB] = newTestBackend(addrB)
+
+	bckA := newTestBackend("192.0.2.1:6443")
+	prx.backends[bckA.addr] = bckA
+
+	prx.cancel()
+
+	client, clientPeer := net.Pipe()
+	upstream, upstreamPeer := net.Pipe()
+
+	t.Cleanup(func() {
+		clientPeer.Close()
+		upstreamPeer.Close()
+	})
+
+	prx.serveConn(bckA, &trackedConn{client: client, upstream: upstream}, true)
+
+	assert.Zero(t, logs.FilterMessage("upstream started draining during dial, retrying").Len(),
+		"a shutdown refusal must not retry")
+	requireNoEarlierAccept(t, addrB, acceptsB)
+}
+
+func TestDialAndServe_DialFailure_DoesNotRetry(t *testing.T) {
+	prx, logs := newObservedProxy()
+
+	addrB, acceptsB := startEchoBackend(t)
+	prx.backends[addrB] = newTestBackend(addrB)
+
+	// One earlier failure: this dial failure excludes A, so a retry would
+	// have only B left to pick.
+	bckA := newTestBackend(deadAddr(t))
+	bckA.failures.Store(1)
+	prx.backends[bckA.addr] = bckA
+
+	client, clientPeer := net.Pipe()
+	t.Cleanup(func() { clientPeer.Close() })
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		prx.dialAndServe(client, bckA, true)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("a failed dial must close the client instead of serving it elsewhere")
+	}
+
+	requireNoEarlierAccept(t, addrB, acceptsB)
+
+	assert.False(t, bckA.healthy.Load(), "the dial failure must count toward exclusion")
+	assert.Contains(t, scrapeInternal(t, prx.metrics),
+		`extractedprism_connection_errors_total{upstream="`+bckA.addr+`"} 1`)
+	assert.Equal(t, 1, logs.FilterMessage("upstream dial failed").Len())
+	assert.Zero(t, logs.FilterMessage("upstream started draining during dial, retrying").Len())
+}
+
+func TestHandleConn_BothPicksDrainMidDial_RetriesOnceThenFails(t *testing.T) {
+	prx, logs := newObservedProxy()
+
+	addrA, acceptsA := startEchoBackend(t)
+	addrB, acceptsB := startEchoBackend(t)
+	bckA := newTestBackend(addrA)
+	bckB := newTestBackend(addrB)
+	bckB.healthy.Store(false) // the first pick must be A
+	prx.backends[addrA] = bckA
+	prx.backends[addrB] = bckB
+
+	// Holding a backend's mutex parks registration right after its dial,
+	// which opens the mid-dial drain window without timing.
+	bckA.mu.Lock()
+	bckB.mu.Lock()
+
+	client, clientPeer := net.Pipe()
+	t.Cleanup(func() { clientPeer.Close() })
+
+	prx.wg.Add(1)
+
+	go prx.handleConn(client)
+
+	require.Eventually(t, func() bool { return acceptsA.Load() == 1 }, 3*time.Second, 10*time.Millisecond)
+	bckA.draining.Store(true)
+	bckB.healthy.Store(true)
+	bckA.mu.Unlock()
+
+	require.Eventually(t, func() bool { return acceptsB.Load() == 1 }, 3*time.Second, 10*time.Millisecond,
+		"the refused connection must be retried on the other backend")
+	bckB.draining.Store(true)
+	bckB.mu.Unlock()
+
+	require.NoError(t, clientPeer.SetDeadline(time.Now().Add(3*time.Second)))
+
+	_, err := clientPeer.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF, "a refused retry closes the client")
+
+	// The client sees EOF before the handler records the error.
+	prx.wg.Wait()
+
+	body := scrapeInternal(t, prx.metrics)
+	assert.Contains(t, body, `extractedprism_connection_errors_total{upstream="`+addrB+`"} 1`,
+		"the refused retry counts against its backend")
+	assert.NotContains(t, body, `extractedprism_connection_errors_total{upstream="`+addrA+`"}`,
+		"the retried refusal did not fail the client")
+	assert.NotContains(t, body, `upstream="none"`, "there is only one retry")
+	assert.Equal(t, 1, logs.FilterMessage("upstream started draining during dial, retrying").Len())
 }
