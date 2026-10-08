@@ -35,6 +35,7 @@ type LivenessChecker interface {
 // Server serves HTTP health-check endpoints.
 type Server struct {
 	httpServer *http.Server
+	mux        *http.ServeMux
 	checker    Checker
 	liveness   LivenessChecker
 	logger     *zap.Logger
@@ -48,9 +49,20 @@ type Server struct {
 	livenessLogged atomic.Bool
 }
 
+// Option configures optional Server behavior.
+type Option func(*Server)
+
+// WithMetrics serves the given handler at /metrics alongside the health
+// endpoints. Without it the route does not exist.
+func WithMetrics(handler http.Handler) Option {
+	return func(s *Server) {
+		s.mux.Handle("/metrics", allowReadOnly(handler.ServeHTTP))
+	}
+}
+
 // NewServer creates a health Server bound to the given address and port.
 // Panics if checker, liveness, or logger is nil.
-func NewServer(bindAddress string, port int, checker Checker, liveness LivenessChecker, logger *zap.Logger) *Server {
+func NewServer(bindAddress string, port int, checker Checker, liveness LivenessChecker, logger *zap.Logger, opts ...Option) *Server {
 	if checker == nil {
 		panic("health.NewServer: checker must not be nil")
 	}
@@ -72,6 +84,7 @@ func NewServer(bindAddress string, port int, checker Checker, liveness LivenessC
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", allowReadOnly(srv.handleHealthz))
 	mux.HandleFunc("/readyz", allowReadOnly(srv.handleReadyz))
+	srv.mux = mux
 
 	srv.httpServer = &http.Server{
 		Addr:              fmt.Sprintf("%s:%d", bindAddress, port),
@@ -80,6 +93,10 @@ func NewServer(bindAddress string, port int, checker Checker, liveness LivenessC
 		ReadTimeout:       readTimeout,
 		WriteTimeout:      writeTimeout,
 		IdleTimeout:       idleTimeout,
+	}
+
+	for _, opt := range opts {
+		opt(srv)
 	}
 
 	return srv

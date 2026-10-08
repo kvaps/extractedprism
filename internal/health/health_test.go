@@ -514,3 +514,51 @@ func TestNewServer_NilLogger_Panics(t *testing.T) {
 		health.NewServer("127.0.0.1", 0, checker, checker, nil)
 	}, "NewServer must panic when logger is nil")
 }
+
+func TestMetrics_ServedWhenConfigured(t *testing.T) {
+	checker := newMockChecker(true, true)
+	metricsHandler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("metrics\n"))
+	})
+
+	srv := health.NewServer("127.0.0.1", 0, checker, checker, newTestLogger(), health.WithMetrics(metricsHandler))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "metrics\n", rec.Body.String())
+}
+
+func TestMetrics_NotFoundWithoutHandler(t *testing.T) {
+	checker := newMockChecker(true, true)
+	srv := health.NewServer("127.0.0.1", 0, checker, checker, newTestLogger())
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusNotFound, rec.Code,
+		"/metrics must not exist when no handler is configured")
+}
+
+func TestMetrics_ReadOnlyMethods(t *testing.T) {
+	checker := newMockChecker(true, true)
+	metricsHandler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	srv := health.NewServer("127.0.0.1", 0, checker, checker, newTestLogger(), health.WithMetrics(metricsHandler))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/metrics", nil)
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusMethodNotAllowed, rec.Code,
+		"/metrics must reject non-read methods like the other endpoints")
+}
