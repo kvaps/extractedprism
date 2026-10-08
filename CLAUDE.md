@@ -51,15 +51,15 @@ Core pipeline: `Server.Run()` starts the load balancer, then runs discovery, hea
 
 ```text
 main.go → server.Server
-              ├─ controlplane.LoadBalancer (siderolabs/go-loadbalancer)
+              ├─ proxy.Proxy (in-house TCP LB with draining and metrics)
               ├─ merged.Provider
               │     ├─ static.Provider (immediate, always present)
               │     └─ kubernetes.Provider (optional, EndpointSlice watch)
-              ├─ heartbeat probe (periodic LB health check for liveness)
-              └─ health.Server (/healthz, /readyz)
+              ├─ heartbeat probe (periodic proxy health check for liveness)
+              └─ health.Server (/healthz, /readyz, /metrics)
 ```
 
-**Key interface**: `discovery.EndpointProvider` — `Run(ctx, updateCh chan<- []string) error`. Providers send endpoint lists on `updateCh`; the merged provider deduplicates and forwards to the load balancer.
+**Key interface**: `discovery.EndpointProvider` — `Run(ctx, updateCh chan<- []string) error` plus `Name() string` (metrics label). Providers send endpoint lists on `updateCh`; the merged provider deduplicates and forwards to the proxy.
 
 **Dependency injection**: `server.New()` accepts `Option` funcs. Production options: `WithKubeClient`. Testing-only options: `WithHealthServer`, `WithLivenessConfig`, `WithLivenessProbe`, `WithDiscoveryProviders`.
 

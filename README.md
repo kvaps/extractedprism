@@ -56,9 +56,9 @@ extractedprism takes a different approach: each node runs its own load balancer 
                        +-------------------------------------------+
 ```
 
-### Core library
+### Data path
 
-extractedprism uses [`siderolabs/go-loadbalancer`](https://github.com/siderolabs/go-loadbalancer) as its TCP L4 proxy engine. This library provides connection-level load balancing with configurable health checks, keepalive, and dial timeouts.
+extractedprism ships its own TCP L4 proxy (`internal/proxy`): an accept loop forwarding to a health-checked set of upstream endpoints, with per-upstream connection tracking, Prometheus metrics, and graceful connection draining. No external load-balancing library is involved.
 
 ### Two-level endpoint discovery
 
@@ -140,6 +140,7 @@ All flags are bound to environment variables with the `EP_` prefix. For example,
 | `--log-level` | `EP_LOG_LEVEL` | `info` | Log level (`debug`, `info`, `warn`, `error`, `dpanic`, `panic`, `fatal`) |
 | `--liveness-interval` | `EP_LIVENESS_INTERVAL` | `5s` | Heartbeat probe interval for liveness detection |
 | `--liveness-threshold` | `EP_LIVENESS_THRESHOLD` | `15s` | Maximum time since last heartbeat before liveness fails |
+| `--drain-timeout` | `EP_DRAIN_TIMEOUT` | `30s` | Grace period for connections to removed endpoints before force close (`0` closes immediately) |
 
 ### Validation rules
 
@@ -151,6 +152,7 @@ All flags are bound to environment variables with the `EP_` prefix. For example,
 - `--log-level` must be one of `debug`, `info`, `warn`, `error`, `dpanic`, `panic`, `fatal`
 - `--liveness-interval` and `--liveness-threshold` must be at least 1 second
 - `--liveness-threshold` must be greater than `--liveness-interval`
+- `--drain-timeout` must not be negative
 
 ## Examples
 
@@ -160,12 +162,16 @@ All flags are bound to environment variables with the `EP_` prefix. For example,
 
 ### Load balancer
 
-The TCP load balancer is created via `controlplane.NewLoadBalancer` from `siderolabs/go-loadbalancer`. It accepts a channel of upstream endpoint lists and routes incoming TCP connections to healthy backends. The load balancer applies:
+The TCP load balancer is implemented in `internal/proxy`. It accepts a channel of upstream endpoint lists and routes incoming TCP connections to healthy backends. The proxy applies:
 
 - Configurable dial timeout (matches `--health-timeout`)
-- TCP keepalive with a 30-second period
-- TCP user timeout of 30 seconds
-- Periodic health checks at the configured interval and timeout
+- TCP keepalive on both client and upstream connections: probes start after 30 seconds idle, with Go's default probe interval and count
+- TCP user timeout of 30 seconds on both client and upstream connections (Linux only)
+- Periodic health checks at the configured interval and timeout; two consecutive failures exclude an upstream, one success re-includes it. Failed and successful client dials count toward the same streak
+
+### Graceful draining
+
+When an endpoint disappears from the upstream list (node cordon, API server rolling restart), the proxy stops routing new connections to it but lets existing connections finish within `--drain-timeout`. Remaining connections are force-closed when the timeout expires. Re-adding the endpoint before the timeout aborts the drain. A timeout of `0` closes connections to removed endpoints immediately.
 
 ### Endpoint discovery
 
@@ -178,16 +184,31 @@ The merged provider deduplicates endpoints across all sub-providers and sends th
 
 ### Health server
 
-The health HTTP server exposes two endpoints on the configured health port:
+The health HTTP server exposes two probe endpoints on the configured health port, plus `/metrics` (see below):
 
 - **`/healthz`** (liveness): Returns HTTP 200 while the Run loop and load balancer goroutine are responsive. Returns HTTP 503 if the heartbeat probe detects the system is no longer alive (e.g., deadlocked LB, crashed Run loop, exited discovery pipeline).
-- **`/readyz`** (readiness): Queries the load balancer's `Healthy()` method. Returns HTTP 200 if at least one upstream is reachable, HTTP 503 otherwise.
+- **`/readyz`** (readiness): Queries the proxy's `Healthy()` method. Returns HTTP 200 if at least one upstream is healthy and not draining, HTTP 503 otherwise.
 
 Both endpoints accept only GET and HEAD requests. Other methods return 405 Method Not Allowed. OPTIONS returns 204 with the allowed methods.
 
+### Metrics
+
+The health server also exposes Prometheus metrics at `/metrics`. It binds to `--bind-address` by default, which is `127.0.0.1`; set `--health-bind-address` to an address Prometheus can reach to scrape it.
+
+| Metric | Type | Labels | Description |
+| --- | --- | --- | --- |
+| `extractedprism_upstreams_active` | Gauge | | Upstreams eligible for new connections (healthy, not draining) |
+| `extractedprism_upstreams_total` | Gauge | | Total known upstreams, including unhealthy and draining |
+| `extractedprism_connections_active` | Gauge | | TCP connections currently passing through the proxy |
+| `extractedprism_connections_total` | Counter | | Connections established to upstreams since start |
+| `extractedprism_connection_errors_total` | Counter | `upstream` | Failed connection attempts (`none` when no upstream was available) |
+| `extractedprism_discovery_updates_total` | Counter | `provider` | Endpoint list updates received (`static`, `kubernetes`) |
+| `extractedprism_discovery_errors_total` | Counter | `provider` | Discovery errors: provider failures, failed Watch calls, watch error events and failed re-lists. A watch stream ending is not counted, including on a dropped connection, and neither is 410 Gone expiry; a dead upstream shows in `health_check_status` instead |
+| `extractedprism_health_check_status` | Gauge | `upstream` | Upstream health state after the consecutive-failure threshold, fed by health checks and client dials (1 healthy, 0 unhealthy). Health checks stop while an upstream drains, so the value holds until it is removed or re-added |
+
 ### Graceful shutdown
 
-On `SIGINT` or `SIGTERM`, the server cancels its context, which stops endpoint discovery, shuts down the TCP load balancer (closing the listener and waiting for active connections to drain), and initiates a 5-second graceful shutdown of the health HTTP server.
+On `SIGINT` or `SIGTERM`, the server cancels its context, which stops endpoint discovery, shuts down the TCP proxy (closing the listener, force-closing in-flight connections, and waiting up to 5 seconds for proxy goroutines to exit), and initiates a 5-second graceful shutdown of the health HTTP server.
 
 ## Security
 
@@ -224,8 +245,10 @@ internal/
 │   ├── static/static.go               # Static endpoints from --endpoints flag
 │   ├── kubernetes/kubernetes.go        # EndpointSlice Watch-based discovery
 │   └── merged/merged.go               # Merge and deduplicate multiple providers
-├── health/health.go                    # HTTP /healthz and /readyz server
-└── server/server.go                    # Orchestrates LB, discovery, and health
+├── health/health.go                    # HTTP /healthz, /readyz, and /metrics server
+├── metrics/metrics.go                  # Prometheus metric set
+├── proxy/proxy.go                      # TCP data path: accept, dial, health checks, draining
+└── server/server.go                    # Orchestrates proxy, discovery, and health
 Containerfile                           # Multi-stage build (golang:alpine -> scratch)
 ```
 
