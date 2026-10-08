@@ -19,6 +19,7 @@ const stableEndpoint = "10.0.0.1:6443"
 
 // mockProvider implements EndpointProvider for testing.
 type mockProvider struct {
+	name     string
 	sendFunc func(ctx context.Context, ch chan<- []string) error
 }
 
@@ -28,9 +29,14 @@ func (m *mockProvider) Run(ctx context.Context, ch chan<- []string) error {
 	return m.sendFunc(ctx, ch)
 }
 
+func (m *mockProvider) Name() string {
+	return m.name
+}
+
 // newImmediateProvider returns a mock that sends endpoints once and blocks.
 func newImmediateProvider(endpoints []string) *mockProvider {
 	return &mockProvider{
+		name: "mock",
 		sendFunc: func(ctx context.Context, ch chan<- []string) error {
 			ch <- endpoints
 
@@ -48,6 +54,7 @@ func newDelayedUpdateProvider(
 	trigger <-chan struct{},
 ) *mockProvider {
 	return &mockProvider{
+		name: "mock",
 		sendFunc: func(ctx context.Context, ch chan<- []string) error {
 			ch <- initial
 
@@ -68,6 +75,7 @@ func newDelayedUpdateProvider(
 // newErrorProvider returns a mock that fails immediately.
 func newErrorProvider(err error) *mockProvider {
 	return &mockProvider{
+		name: "mock",
 		sendFunc: func(_ context.Context, _ chan<- []string) error {
 			return err
 		},
@@ -77,6 +85,7 @@ func newErrorProvider(err error) *mockProvider {
 // newGracefulExitProvider sends endpoints once and returns nil (graceful exit).
 func newGracefulExitProvider(endpoints []string) *mockProvider {
 	return &mockProvider{
+		name: "mock",
 		sendFunc: func(_ context.Context, ch chan<- []string) error {
 			ch <- endpoints
 
@@ -93,6 +102,7 @@ func newSendThenErrorProvider(
 	trigger <-chan struct{},
 ) *mockProvider {
 	return &mockProvider{
+		name: "mock",
 		sendFunc: func(ctx context.Context, ch chan<- []string) error {
 			ch <- endpoints
 
@@ -109,6 +119,7 @@ func newSendThenErrorProvider(
 // newEmptyThenNothingProvider sends an empty list and blocks.
 func newEmptyThenNothingProvider() *mockProvider {
 	return &mockProvider{
+		name: "mock",
 		sendFunc: func(ctx context.Context, ch chan<- []string) error {
 			ch <- []string{}
 
@@ -141,7 +152,7 @@ func TestRun_SingleProvider(t *testing.T) {
 	log := zaptest.NewLogger(t)
 	provider := newImmediateProvider([]string{"10.0.0.1:6443"})
 
-	mp := merged.NewMergedProvider(log, provider)
+	mp := merged.NewMergedProvider(log, nil, provider)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -169,7 +180,7 @@ func TestRun_MergesProviders(t *testing.T) {
 	prov1 := newImmediateProvider([]string{"10.0.0.1:6443"})
 	prov2 := newImmediateProvider([]string{"10.0.0.2:6443"})
 
-	mp := merged.NewMergedProvider(log, prov1, prov2)
+	mp := merged.NewMergedProvider(log, nil, prov1, prov2)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -205,7 +216,7 @@ func TestRun_Deduplicates(t *testing.T) {
 	prov1 := newImmediateProvider([]string{"10.0.0.1:6443", "10.0.0.2:6443"})
 	prov2 := newImmediateProvider([]string{"10.0.0.2:6443", "10.0.0.3:6443"})
 
-	mp := merged.NewMergedProvider(log, prov1, prov2)
+	mp := merged.NewMergedProvider(log, nil, prov1, prov2)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -240,7 +251,7 @@ func TestRun_NeverSendsEmpty(t *testing.T) {
 	log := zaptest.NewLogger(t)
 	prov := newEmptyThenNothingProvider()
 
-	mp := merged.NewMergedProvider(log, prov)
+	mp := merged.NewMergedProvider(log, nil, prov)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -278,7 +289,7 @@ func TestRun_DynamicUpdatePropagates(t *testing.T) {
 		trigger,
 	)
 
-	mp := merged.NewMergedProvider(log, prov)
+	mp := merged.NewMergedProvider(log, nil, prov)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -304,7 +315,7 @@ func TestRun_ContextCancellation(t *testing.T) {
 	log := zaptest.NewLogger(t)
 	prov := newImmediateProvider([]string{"10.0.0.1:6443"})
 
-	mp := merged.NewMergedProvider(log, prov)
+	mp := merged.NewMergedProvider(log, nil, prov)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	updateCh := make(chan []string, 10)
@@ -330,7 +341,7 @@ func TestRun_SingleProviderFailureDoesNotKillOthers(t *testing.T) {
 	healthy := newImmediateProvider([]string{"10.0.0.1:6443"})
 	failing := newErrorProvider(errors.New("kubernetes API unavailable"))
 
-	mp := merged.NewMergedProvider(log, healthy, failing)
+	mp := merged.NewMergedProvider(log, nil, healthy, failing)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -378,7 +389,7 @@ func TestRun_FailedProviderEndpointsAreCleared(t *testing.T) {
 	// Healthy provider stays alive.
 	healthy := newImmediateProvider([]string{"10.0.0.1:6443"})
 
-	mp := merged.NewMergedProvider(log, healthy, failing)
+	mp := merged.NewMergedProvider(log, nil, healthy, failing)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -410,7 +421,7 @@ func TestRun_AllProvidersFailReturnsError(t *testing.T) {
 	err1 := errors.New("provider 1 failed")
 	err2 := errors.New("provider 2 failed")
 
-	mp := merged.NewMergedProvider(log,
+	mp := merged.NewMergedProvider(log, nil,
 		newErrorProvider(err1),
 		newErrorProvider(err2),
 	)
@@ -437,7 +448,7 @@ func TestRun_ProviderError(t *testing.T) {
 	provErr := errors.New("provider failed")
 	prov := newErrorProvider(provErr)
 
-	mp := merged.NewMergedProvider(log, prov)
+	mp := merged.NewMergedProvider(log, nil, prov)
 
 	ctx := t.Context()
 
@@ -461,7 +472,7 @@ func TestRun_GracefulExitPlusErrorDoesNotHang(t *testing.T) {
 	graceful := newGracefulExitProvider([]string{"10.0.0.1:6443"})
 	failing := newErrorProvider(errors.New("provider failed"))
 
-	mp := merged.NewMergedProvider(log, graceful, failing)
+	mp := merged.NewMergedProvider(log, nil, graceful, failing)
 
 	errCh := make(chan error, 1)
 
@@ -480,7 +491,7 @@ func TestRun_AllGracefulExitReturnsNil(t *testing.T) {
 	prov1 := newGracefulExitProvider([]string{"10.0.0.1:6443"})
 	prov2 := newGracefulExitProvider([]string{"10.0.0.2:6443"})
 
-	mp := merged.NewMergedProvider(log, prov1, prov2)
+	mp := merged.NewMergedProvider(log, nil, prov1, prov2)
 
 	errCh := make(chan error, 1)
 
@@ -496,7 +507,7 @@ func TestRun_AllGracefulExitReturnsNil(t *testing.T) {
 
 func TestRun_ZeroProvidersReturnsError(t *testing.T) {
 	log := zaptest.NewLogger(t)
-	mp := merged.NewMergedProvider(log)
+	mp := merged.NewMergedProvider(log, nil)
 
 	err := mp.Run(t.Context(), make(chan []string, 1))
 	require.Error(t, err)
@@ -529,7 +540,7 @@ func TestRun_BurstUpdatesWithSlowConsumer(t *testing.T) {
 		},
 	}
 
-	mp := merged.NewMergedProvider(log, burstProv)
+	mp := merged.NewMergedProvider(log, nil, burstProv)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	updateCh := make(chan []string, 1)
@@ -593,7 +604,7 @@ func TestRun_DrainCoalescesUpdates(t *testing.T) {
 		},
 	}
 
-	mp := merged.NewMergedProvider(log, burstProv)
+	mp := merged.NewMergedProvider(log, nil, burstProv)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	updateCh := make(chan []string, 1)
@@ -669,7 +680,7 @@ func TestRun_NilUpdateDeletesMapEntry(t *testing.T) {
 	// Provider 1: stays alive with stable endpoints.
 	stableProv := newImmediateProvider([]string{"10.0.0.1:6443"})
 
-	mp := merged.NewMergedProvider(log, clearingProv, stableProv)
+	mp := merged.NewMergedProvider(log, nil, clearingProv, stableProv)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -748,7 +759,7 @@ func TestRun_EmptySliceUpdateDeletesMapEntry(t *testing.T) {
 
 	stableProv := newImmediateProvider([]string{"10.0.0.1:6443"})
 
-	mp := merged.NewMergedProvider(log, clearingProv, stableProv)
+	mp := merged.NewMergedProvider(log, nil, clearingProv, stableProv)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -826,7 +837,7 @@ func TestRun_BackpressureDoesNotBlockProviders(t *testing.T) {
 		},
 	}
 
-	mp := merged.NewMergedProvider(log, burstProv)
+	mp := merged.NewMergedProvider(log, nil, burstProv)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -912,7 +923,7 @@ func TestRun_BackpressureSendsLatestValue(t *testing.T) {
 		},
 	}
 
-	mp := merged.NewMergedProvider(log, burstProv)
+	mp := merged.NewMergedProvider(log, nil, burstProv)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -992,7 +1003,7 @@ func TestRun_SendWithDrainEmptyMergeDoesNotSendEmpty(t *testing.T) {
 		},
 	}
 
-	mp := merged.NewMergedProvider(log, prov)
+	mp := merged.NewMergedProvider(log, nil, prov)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

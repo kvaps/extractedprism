@@ -38,16 +38,44 @@ type Provider struct {
 	apiPort      string
 	knownSlices  map[string][]discoveryv1.Endpoint
 	hadEndpoints bool
+	onError      func()
 }
 
 // NewProvider creates a Kubernetes discovery provider.
-func NewProvider(client kubernetes.Interface, logger *zap.Logger, apiPort string) *Provider {
-	return &Provider{
+func NewProvider(client kubernetes.Interface, logger *zap.Logger, apiPort string, opts ...Option) *Provider {
+	prov := &Provider{
 		client:      client,
 		logger:      logger,
 		apiPort:     apiPort,
 		knownSlices: make(map[string][]discoveryv1.Endpoint),
+		onError:     func() {},
 	}
+
+	for _, opt := range opts {
+		opt(prov)
+	}
+
+	return prov
+}
+
+// Option configures a Provider.
+type Option func(*Provider)
+
+// WithErrorHook registers a callback for errors the provider recovers from
+// on its own (watch restarts, failed re-lists). They never surface through
+// Run's return value, so without the hook they are visible only in logs.
+func WithErrorHook(hook func()) Option {
+	return func(p *Provider) {
+		p.onError = hook
+	}
+}
+
+// ProviderName is the provider's Name and its discovery metrics label.
+const ProviderName = "kubernetes"
+
+// Name implements discovery.EndpointProvider.
+func (p *Provider) Name() string {
+	return ProviderName
 }
 
 // Run watches kubernetes EndpointSlices and sends updates on updateCh until ctx is done.
@@ -106,6 +134,15 @@ func (p *Provider) watchLoop(
 		}
 
 		attempt++
+
+		// Server-side stream ends and 410 Gone (etcd compaction, handled by a
+		// re-list) are routine on long-lived watches; counting them would grow
+		// the error metric on a healthy cluster. A failed re-list is still
+		// reported below.
+		if !errors.Is(watchErr, errGone) && !errors.Is(watchErr, errWatchClosed) {
+			p.onError()
+		}
+
 		p.logger.Warn("watch error, restarting with backoff",
 			zap.Error(watchErr), zap.Int("attempt", attempt))
 
@@ -150,6 +187,7 @@ func (p *Provider) handleGoneRelist(
 
 	endpoints, newVer, listErr := p.listEndpoints(ctx)
 	if listErr != nil {
+		p.onError()
 		p.logger.Warn("re-list failed, retaining cached endpoints", zap.Error(listErr))
 		p.knownSlices = oldSlices
 
@@ -169,6 +207,13 @@ func (p *Provider) handleGoneRelist(
 }
 
 var errGone = errors.New("watch 410 Gone")
+
+// errWatchClosed marks a watch stream that ended without an error event.
+// client-go reports the server's own watch timeout and a dropped connection
+// (EOF, reset, network timeout) the same way, so this covers both. Neither
+// is reported: a dead upstream shows in its health_check_status, and if no
+// upstream is reachable the following Watch call fails and is reported.
+var errWatchClosed = errors.New("watch channel closed")
 
 // BackoffDelay calculates exponential backoff with jitter for the given attempt number.
 // Attempt must be >= 1. Jitter adds up to 25% random variation to prevent thundering herd.
@@ -219,7 +264,7 @@ func (p *Provider) handleEvents(
 			return nil
 		case event, ok := <-watcher.ResultChan():
 			if !ok {
-				return errors.New("watch channel closed")
+				return errWatchClosed
 			}
 
 			processErr := p.processEvent(ctx, event, updateCh, resVer)

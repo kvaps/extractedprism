@@ -29,6 +29,8 @@ func (immediateProvider) Run(_ context.Context, _ chan<- []string) error {
 	return nil
 }
 
+func (immediateProvider) Name() string { return "immediate" }
+
 // errorProvider returns an error from Run immediately, simulating a
 // discovery failure. Used to test the discoveryDone path in Alive().
 type errorProvider struct {
@@ -38,6 +40,8 @@ type errorProvider struct {
 func (e errorProvider) Run(_ context.Context, _ chan<- []string) error {
 	return e.err
 }
+
+func (errorProvider) Name() string { return "error" }
 
 // Compile-time checks.
 var (

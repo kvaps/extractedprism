@@ -220,3 +220,11 @@ func TestStaticProvider_Run_CancelsCleanly(t *testing.T) {
 	runErr := waitForResult(t, errCh)
 	assert.NoError(t, runErr)
 }
+
+func TestName_IsStatic(t *testing.T) {
+	provider, err := static.NewStaticProvider([]string{"192.0.2.1:6443"})
+	require.NoError(t, err)
+
+	// The name is the "provider" label value on discovery metrics.
+	assert.Equal(t, "static", provider.Name())
+}

@@ -32,6 +32,8 @@ const (
 
 var errSimulatedListFailure = errors.New("simulated list failure")
 
+var errSimulatedWatchFailure = errors.New("simulated watch failure")
+
 func newTestLogger() *zap.Logger {
 	return zap.NewNop()
 }
@@ -1496,6 +1498,256 @@ func TestRun_MutatingOriginalDeprecatedTopologyDoesNotCorruptCache(t *testing.T)
 	// The important thing is that the endpoint addresses are not corrupted.
 	assert.ElementsMatch(t, []string{"10.0.0.1:6443", "10.0.0.2:6443"}, endpoints,
 		"mutating original DeprecatedTopology after storage must not corrupt the cache")
+
+	cancel()
+	waitForRun(t, errCh)
+}
+
+func TestName_IsKubernetes(t *testing.T) {
+	provider := kubediscovery.NewProvider(fake.NewClientset(), newTestLogger(), testAPIPort)
+
+	// The name is the "provider" label value on discovery metrics.
+	assert.Equal(t, "kubernetes", provider.Name())
+}
+
+func TestRun_RecoveredWatchError_ReportedToErrorHook(t *testing.T) {
+	initial := makeEndpointSlice("10.0.0.1")
+	client := fake.NewClientset(initial)
+
+	fakeWatcher := watch.NewFake()
+	client.PrependWatchReactor("endpointslices", k8stesting.DefaultWatchReactor(fakeWatcher, nil))
+
+	var reported atomic.Int32
+
+	provider := kubediscovery.NewProvider(client, newTestLogger(), testAPIPort,
+		kubediscovery.WithErrorHook(func() { reported.Add(1) }))
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	updateCh := make(chan []string, 10)
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- provider.Run(ctx, updateCh)
+	}()
+
+	receiveEndpoints(t, updateCh)
+
+	fakeWatcher.Error(&metav1.Status{
+		Status: metav1.StatusFailure,
+		Code:   500,
+		Reason: metav1.StatusReasonInternalError,
+	})
+
+	// The provider survives the error on its own; it must still surface it.
+	require.Eventually(t, func() bool {
+		return reported.Load() == 1
+	}, receiveTimeout, 10*time.Millisecond, "a recovered watch error must reach the error hook")
+
+	cancel()
+	waitForRun(t, errCh)
+}
+
+func TestRun_RelistFailure_ReportedToErrorHook(t *testing.T) {
+	initial := makeEndpointSlice("10.0.0.1")
+	client := fake.NewClientset(initial)
+
+	fakeWatcher := watch.NewFake()
+	client.PrependWatchReactor("endpointslices", k8stesting.DefaultWatchReactor(fakeWatcher, nil))
+
+	var listCount atomic.Int32
+
+	client.PrependReactor("list", "endpointslices",
+		func(_ k8stesting.Action) (bool, runtime.Object, error) {
+			if listCount.Add(1) > 1 {
+				return true, nil, errSimulatedListFailure
+			}
+
+			return false, nil, nil
+		},
+	)
+
+	var reported atomic.Int32
+
+	core, logs := observer.New(zap.WarnLevel)
+	provider := kubediscovery.NewProvider(client, zap.New(core), testAPIPort,
+		kubediscovery.WithErrorHook(func() { reported.Add(1) }))
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	updateCh := make(chan []string, 10)
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- provider.Run(ctx, updateCh)
+	}()
+
+	receiveEndpoints(t, updateCh)
+
+	fakeWatcher.Error(&metav1.Status{
+		Status: metav1.StatusFailure,
+		Code:   410,
+		Reason: metav1.StatusReasonGone,
+	})
+
+	require.Eventually(t, func() bool {
+		return logs.FilterMessage("re-list failed, retaining cached endpoints").Len() > 0
+	}, receiveTimeout, 10*time.Millisecond, "expected re-list failure log")
+
+	// Checked at the moment the re-list failure is logged. The 410 itself is
+	// routine and not reported, so the one report is the failed re-list.
+	// Polling instead would also pass via the next watch restart after
+	// backoff, without the re-list counted.
+	assert.Equal(t, int32(1), reported.Load(), "a failed re-list must reach the error hook")
+
+	cancel()
+	waitForRun(t, errCh)
+}
+
+func TestRun_GoneWithSuccessfulRelist_NotReportedToErrorHook(t *testing.T) {
+	initial := makeEndpointSlice("10.0.0.1")
+	client := fake.NewClientset(initial)
+
+	// Only the first Watch gets the controllable watcher; later ones get a
+	// fresh, quiet stream like a real API server would open.
+	fakeWatcher := watch.NewFake()
+
+	var watchCalls atomic.Int32
+
+	client.PrependWatchReactor("endpointslices", func(_ k8stesting.Action) (bool, watch.Interface, error) {
+		if watchCalls.Add(1) == 1 {
+			return true, fakeWatcher, nil
+		}
+
+		return true, watch.NewFake(), nil
+	})
+
+	var reported atomic.Int32
+
+	provider := kubediscovery.NewProvider(client, newTestLogger(), testAPIPort,
+		kubediscovery.WithErrorHook(func() { reported.Add(1) }))
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	updateCh := make(chan []string, 10)
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- provider.Run(ctx, updateCh)
+	}()
+
+	receiveEndpoints(t, updateCh)
+
+	fakeWatcher.Error(&metav1.Status{
+		Status: metav1.StatusFailure,
+		Code:   410,
+		Reason: metav1.StatusReasonGone,
+	})
+
+	// The successful re-list publishes endpoints again; by then the 410 has
+	// been fully handled. Watch expiry on a healthy cluster is not an error.
+	receiveEndpoints(t, updateCh)
+
+	assert.Never(t, func() bool {
+		return reported.Load() != 0
+	}, 300*time.Millisecond, 10*time.Millisecond, "routine 410 Gone must not count as a discovery error")
+
+	cancel()
+	waitForRun(t, errCh)
+}
+
+func TestRun_ServerClosedWatch_NotReportedToErrorHook(t *testing.T) {
+	initial := makeEndpointSlice("10.0.0.1")
+	client := fake.NewClientset(initial)
+
+	// The API server ends every watch after its own timeout. Later watches
+	// get a fresh, quiet stream, as a real server would open.
+	fakeWatcher := watch.NewFake()
+
+	var watchCalls atomic.Int32
+
+	client.PrependWatchReactor("endpointslices", func(_ k8stesting.Action) (bool, watch.Interface, error) {
+		if watchCalls.Add(1) == 1 {
+			return true, fakeWatcher, nil
+		}
+
+		return true, watch.NewFake(), nil
+	})
+
+	var reported atomic.Int32
+
+	provider := kubediscovery.NewProvider(client, newTestLogger(), testAPIPort,
+		kubediscovery.WithErrorHook(func() { reported.Add(1) }))
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	updateCh := make(chan []string, 10)
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- provider.Run(ctx, updateCh)
+	}()
+
+	receiveEndpoints(t, updateCh)
+
+	fakeWatcher.Stop()
+
+	// The provider re-watches; wait for that so the close was fully handled.
+	require.Eventually(t, func() bool {
+		return watchCalls.Load() >= 2
+	}, receiveTimeout, 10*time.Millisecond, "provider must re-watch after the stream ends")
+
+	assert.Equal(t, int32(0), reported.Load(), "a server-side watch close is routine, not a discovery error")
+
+	cancel()
+	waitForRun(t, errCh)
+}
+
+func TestRun_WatchCallFailure_ReportedToErrorHook(t *testing.T) {
+	initial := makeEndpointSlice("10.0.0.1")
+	client := fake.NewClientset(initial)
+
+	// The first watch opens; every later Watch call fails outright. With
+	// stream ends excluded from the metric, a failing Watch call is the
+	// signal that the watch cannot be re-established.
+	fakeWatcher := watch.NewFake()
+
+	var watchCalls atomic.Int32
+
+	client.PrependWatchReactor("endpointslices", func(_ k8stesting.Action) (bool, watch.Interface, error) {
+		if watchCalls.Add(1) == 1 {
+			return true, fakeWatcher, nil
+		}
+
+		return true, nil, errSimulatedWatchFailure
+	})
+
+	var reported atomic.Int32
+
+	provider := kubediscovery.NewProvider(client, newTestLogger(), testAPIPort,
+		kubediscovery.WithErrorHook(func() { reported.Add(1) }))
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	updateCh := make(chan []string, 10)
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- provider.Run(ctx, updateCh)
+	}()
+
+	receiveEndpoints(t, updateCh)
+
+	fakeWatcher.Stop()
+
+	require.Eventually(t, func() bool {
+		return reported.Load() >= 1
+	}, receiveTimeout, 10*time.Millisecond, "a failing Watch call must reach the error hook")
 
 	cancel()
 	waitForRun(t, errCh)

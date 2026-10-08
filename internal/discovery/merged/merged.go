@@ -10,6 +10,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/lexfrei/extractedprism/internal/discovery"
+	"github.com/lexfrei/extractedprism/internal/metrics"
 )
 
 // providerChBuffer is the buffer size for per-provider and internal channels.
@@ -24,16 +25,20 @@ const providerChBuffer = 16
 // Provider merges endpoints from multiple discovery providers.
 type Provider struct {
 	logger    *zap.Logger
+	metrics   *metrics.Metrics
 	providers []discovery.EndpointProvider
 }
 
 // NewMergedProvider creates a provider that merges results from all given providers.
+// The metrics argument may be nil; discovery metrics are then not recorded.
 func NewMergedProvider(
 	logger *zap.Logger,
+	m *metrics.Metrics,
 	providers ...discovery.EndpointProvider,
 ) *Provider {
 	return &Provider{
 		logger:    logger,
+		metrics:   m,
 		providers: providers,
 	}
 }
@@ -122,7 +127,11 @@ func (mp *Provider) runProvider(
 	}
 
 	mp.logger.Warn("provider failed, continuing with remaining providers",
-		zap.Int("provider", idx), zap.Error(runErr))
+		zap.Int("provider", idx), zap.String("name", prov.Name()), zap.Error(runErr))
+
+	if mp.metrics != nil {
+		mp.metrics.DiscoveryError(prov.Name())
+	}
 
 	errMu.Lock()
 
@@ -156,6 +165,10 @@ func (mp *Provider) forwardUpdates(
 				}
 
 				return
+			}
+
+			if mp.metrics != nil {
+				mp.metrics.DiscoveryUpdate(mp.providers[idx].Name())
 			}
 
 			select {

@@ -373,7 +373,7 @@ func (srv *Server) runDiscovery(ctx context.Context) error {
 		providers = built
 	}
 
-	mp := merged.NewMergedProvider(srv.logger, providers...)
+	mp := merged.NewMergedProvider(srv.logger, nil, providers...)
 
 	runErr := mp.Run(ctx, srv.upstreamCh)
 	if runErr != nil {
