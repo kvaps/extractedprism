@@ -37,6 +37,11 @@ func NewStaticProvider(endpoints []string) (*Provider, error) {
 	return &Provider{endpoints: dst}, nil
 }
 
+// Name implements discovery.EndpointProvider.
+func (stp *Provider) Name() string {
+	return "static"
+}
+
 // Run sends the static endpoints on updateCh and blocks until ctx is cancelled.
 func (stp *Provider) Run(ctx context.Context, updateCh chan<- []string) error {
 	eps := make([]string, len(stp.endpoints))

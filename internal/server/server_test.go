@@ -3,7 +3,9 @@ package server_test
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,10 +13,14 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
+	"go.uber.org/zap/zaptest/observer"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/lexfrei/extractedprism/internal/config"
 	"github.com/lexfrei/extractedprism/internal/discovery"
@@ -29,6 +35,8 @@ func (immediateProvider) Run(_ context.Context, _ chan<- []string) error {
 	return nil
 }
 
+func (immediateProvider) Name() string { return "immediate" }
+
 // errorProvider returns an error from Run immediately, simulating a
 // discovery failure. Used to test the discoveryDone path in Alive().
 type errorProvider struct {
@@ -39,6 +47,8 @@ func (e errorProvider) Run(_ context.Context, _ chan<- []string) error {
 	return e.err
 }
 
+func (errorProvider) Name() string { return "error" }
+
 // Compile-time checks.
 var (
 	_ discovery.EndpointProvider = immediateProvider{}
@@ -48,6 +58,11 @@ var (
 const (
 	waitTimeout = 5 * time.Second
 	pollTick    = 10 * time.Millisecond
+
+	// runReturnTimeout bounds how long tests wait for Run to return. It must
+	// exceed the server's own 5s graceful health-server shutdown, so a slow
+	// but successful shutdown is not reported as a hang.
+	runReturnTimeout = 10 * time.Second
 )
 
 var portCounter atomic.Int32
@@ -74,6 +89,15 @@ func validConfig() *config.Config {
 	return cfg
 }
 
+// newTestHTTPClient returns a client without keep-alive. A pooled transport
+// can dial a spare connection and park it unused; the health server counts
+// such a connection as active for 5 seconds during Shutdown, the same as
+// its own shutdown budget, so a parked connection fails Run with a deadline
+// error.
+func newTestHTTPClient() *http.Client {
+	return &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+}
+
 // waitForHealthz polls the health endpoint until it responds with 200 or the
 // timeout fires. Since /healthz now checks Alive(), this implicitly verifies
 // that Run() has stored the initial heartbeat. This is safe because Run()
@@ -82,9 +106,15 @@ func waitForHealthz(t *testing.T, healthPort int) {
 	t.Helper()
 
 	url := fmt.Sprintf("http://127.0.0.1:%d/healthz", healthPort)
+	client := newTestHTTPClient()
 
 	require.Eventually(t, func() bool {
-		resp, err := http.Get(url) //nolint:noctx // test helper, no context needed
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
+		if err != nil {
+			return false
+		}
+
+		resp, err := client.Do(req)
 		if err != nil {
 			return false
 		}
@@ -133,7 +163,7 @@ func TestAlive_TrueDuringRun(t *testing.T) {
 	select {
 	case err := <-errCh:
 		assert.NoError(t, err)
-	case <-time.After(waitTimeout):
+	case <-time.After(runReturnTimeout):
 		t.Fatal("timed out waiting for shutdown")
 	}
 }
@@ -157,7 +187,7 @@ func TestAlive_FalseAfterRunReturns(t *testing.T) {
 	select {
 	case err := <-errCh:
 		assert.NoError(t, err)
-	case <-time.After(waitTimeout):
+	case <-time.After(runReturnTimeout):
 		t.Fatal("timed out waiting for shutdown")
 	}
 
@@ -202,7 +232,7 @@ func TestAlive_HeartbeatStopsOnBlockedProbe(t *testing.T) {
 	select {
 	case err := <-errCh:
 		assert.NoError(t, err)
-	case <-time.After(waitTimeout):
+	case <-time.After(runReturnTimeout):
 		t.Fatal("timed out waiting for shutdown")
 	}
 }
@@ -238,7 +268,7 @@ func TestAlive_GracefulShutdownWithBlockedProbe(t *testing.T) {
 	select {
 	case err := <-errCh:
 		assert.NoError(t, err)
-	case <-time.After(waitTimeout):
+	case <-time.After(runReturnTimeout):
 		t.Fatal("Run did not return after cancel — goroutine leak in heartbeat probe")
 	}
 }
@@ -272,7 +302,7 @@ func TestRun_StartsAndShutdowns(t *testing.T) {
 	select {
 	case err := <-errCh:
 		assert.NoError(t, err)
-	case <-time.After(waitTimeout):
+	case <-time.After(runReturnTimeout):
 		t.Fatal("timed out waiting for shutdown")
 	}
 }
@@ -297,7 +327,7 @@ func TestRun_StaticOnlyMode(t *testing.T) {
 	select {
 	case err := <-errCh:
 		assert.NoError(t, err)
-	case <-time.After(waitTimeout):
+	case <-time.After(runReturnTimeout):
 		t.Fatal("timed out waiting for shutdown")
 	}
 }
@@ -349,7 +379,7 @@ func TestRun_WithDiscoveryEnabled(t *testing.T) {
 	select {
 	case err := <-errCh:
 		assert.NoError(t, err)
-	case <-time.After(waitTimeout):
+	case <-time.After(runReturnTimeout):
 		t.Fatal("timed out waiting for shutdown")
 	}
 }
@@ -390,7 +420,7 @@ func TestRunHealth_NilReturnDoesNotBlock(t *testing.T) {
 	case err := <-errCh:
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "health server exited unexpectedly")
-	case <-time.After(waitTimeout):
+	case <-time.After(runReturnTimeout):
 		t.Fatal("Run blocked — goroutine leak: Start returned nil but runHealth did not exit")
 	}
 }
@@ -418,7 +448,7 @@ func TestRunHealth_StartErrorPropagates(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "health server start")
 		assert.Contains(t, err.Error(), "address already in use")
-	case <-time.After(waitTimeout):
+	case <-time.After(runReturnTimeout):
 		t.Fatal("Run blocked on health start error")
 	}
 }
@@ -523,7 +553,7 @@ func TestWithLivenessConfig_ValidValues_Applied(t *testing.T) {
 	select {
 	case err := <-errCh:
 		assert.NoError(t, err)
-	case <-time.After(waitTimeout):
+	case <-time.After(runReturnTimeout):
 		t.Fatal("timed out waiting for shutdown")
 	}
 }
@@ -581,7 +611,7 @@ func TestAlive_FalseWhenDiscoveryExits(t *testing.T) {
 	select {
 	case err := <-errCh:
 		assert.NoError(t, err)
-	case <-time.After(waitTimeout):
+	case <-time.After(runReturnTimeout):
 		t.Fatal("timed out waiting for shutdown")
 	}
 }
@@ -612,7 +642,7 @@ func TestRun_DiscoveryErrorPropagates(t *testing.T) {
 	case runErr := <-errCh:
 		require.Error(t, runErr)
 		assert.Contains(t, runErr.Error(), "discovery failed")
-	case <-time.After(waitTimeout):
+	case <-time.After(runReturnTimeout):
 		t.Fatal("timed out waiting for Run to return after discovery error")
 	}
 
@@ -641,7 +671,7 @@ func TestRun_DiscoveryFallbackWithoutCluster(t *testing.T) {
 	select {
 	case err := <-errCh:
 		assert.NoError(t, err)
-	case <-time.After(waitTimeout):
+	case <-time.After(runReturnTimeout):
 		t.Fatal("timed out waiting for shutdown")
 	}
 }
@@ -671,7 +701,7 @@ func TestRun_SeedsLBWithStaticEndpoints(t *testing.T) {
 	select {
 	case err := <-errCh:
 		assert.NoError(t, err)
-	case <-time.After(waitTimeout):
+	case <-time.After(runReturnTimeout):
 		t.Fatal("timed out waiting for shutdown")
 	}
 }
@@ -704,7 +734,181 @@ func TestNew_UsesConfigLivenessValues(t *testing.T) {
 	select {
 	case err := <-errCh:
 		assert.NoError(t, err)
-	case <-time.After(waitTimeout):
+	case <-time.After(runReturnTimeout):
 		t.Fatal("timed out waiting for shutdown")
 	}
+}
+
+// replacingProvider sends one endpoint list and then blocks, replacing the
+// static seed so the seeded endpoint is removed and drained.
+type replacingProvider struct {
+	endpoints []string
+}
+
+func (p replacingProvider) Run(ctx context.Context, ch chan<- []string) error {
+	select {
+	case ch <- p.endpoints:
+	case <-ctx.Done():
+		return nil
+	}
+
+	<-ctx.Done()
+
+	return nil
+}
+
+func (replacingProvider) Name() string { return "replacing" }
+
+var _ discovery.EndpointProvider = replacingProvider{}
+
+func TestRun_ServesMetricsOnHealthPort(t *testing.T) {
+	cfg := validConfig()
+
+	srv, err := server.New(cfg, zaptest.NewLogger(t))
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+
+	go func() { errCh <- srv.Run(ctx) }()
+
+	waitForHealthz(t, cfg.HealthPort)
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/metrics", cfg.HealthPort)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
+	require.NoError(t, err)
+
+	resp, err := newTestHTTPClient().Do(req)
+	require.NoError(t, err)
+
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	require.NoError(t, err)
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode, "/metrics must be served on the health port")
+	assert.Contains(t, string(body), "extractedprism_upstreams_total")
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		assert.NoError(t, err)
+	case <-time.After(runReturnTimeout):
+		t.Fatal("timed out waiting for shutdown")
+	}
+}
+
+func TestRun_DrainTimeoutReachesProxy(t *testing.T) {
+	cfg := validConfig()
+	cfg.DrainTimeout = 7 * time.Second
+
+	core, logs := observer.New(zap.InfoLevel)
+
+	srv, err := server.New(cfg, zap.New(core),
+		server.WithDiscoveryProviders(replacingProvider{endpoints: []string{"127.0.0.1:6444"}}),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+
+	go func() { errCh <- srv.Run(ctx) }()
+
+	// The provider replaces the seeded static endpoint, so the proxy drains
+	// it with the configured timeout.
+	require.Eventually(t, func() bool {
+		entries := logs.FilterMessage("draining upstream").All()
+		if len(entries) == 0 {
+			return false
+		}
+
+		fields := entries[0].ContextMap()
+
+		return fields["upstream"] == cfg.Endpoints[0] && fields["timeout"] == 7*time.Second
+	}, waitTimeout, pollTick, "configured drain timeout must reach the proxy")
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		assert.NoError(t, err)
+	case <-time.After(runReturnTimeout):
+		t.Fatal("timed out waiting for shutdown")
+	}
+}
+
+func TestRun_RecoveredDiscoveryErrors_ReachMetrics(t *testing.T) {
+	cfg := validConfig()
+	cfg.EnableDiscovery = true
+
+	eps := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubernetes",
+			Namespace: "default",
+			Labels:    map[string]string{"kubernetes.io/service-name": "kubernetes"},
+		},
+		Endpoints: []discoveryv1.Endpoint{{Addresses: []string{"127.0.0.1"}}},
+	}
+
+	fakeClient := fake.NewClientset(eps)
+	fakeWatcher := watch.NewFake()
+
+	// Later watches get a fresh, quiet stream, as a real API server would
+	// open.
+	var watchCalls atomic.Int32
+
+	fakeClient.PrependWatchReactor("endpointslices", func(_ k8stesting.Action) (bool, watch.Interface, error) {
+		if watchCalls.Add(1) == 1 {
+			return true, fakeWatcher, nil
+		}
+
+		return true, watch.NewFake(), nil
+	})
+
+	srv, err := server.New(cfg, zaptest.NewLogger(t), server.WithKubeClient(fakeClient))
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+
+	go func() { errCh <- srv.Run(ctx) }()
+
+	// Stop the server on every exit path: a failed assertion must not leave
+	// it running and logging into a finished test.
+	t.Cleanup(func() {
+		cancel()
+
+		select {
+		case err := <-errCh:
+			assert.NoError(t, err)
+		case <-time.After(runReturnTimeout):
+			t.Error("timed out waiting for shutdown")
+		}
+	})
+
+	waitForHealthz(t, cfg.HealthPort)
+
+	// The provider recovers from this error itself, so Run never returns
+	// it; the server must still count it on the discovery metric.
+	fakeWatcher.Error(&metav1.Status{Status: metav1.StatusFailure, Code: 500, Reason: metav1.StatusReasonInternalError})
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/metrics", cfg.HealthPort)
+
+	require.Eventually(t, func() bool {
+		req, reqErr := http.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
+		if reqErr != nil {
+			return false
+		}
+
+		resp, getErr := newTestHTTPClient().Do(req)
+		if getErr != nil {
+			return false
+		}
+		defer resp.Body.Close()
+
+		body, readErr := io.ReadAll(resp.Body)
+
+		return readErr == nil &&
+			strings.Contains(string(body), `extractedprism_discovery_errors_total{provider="kubernetes"} 1`)
+	}, waitTimeout, pollTick, "recovered watch error must reach discovery_errors_total")
 }

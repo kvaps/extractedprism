@@ -9,8 +9,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
-	"github.com/siderolabs/go-loadbalancer/controlplane"
-	"github.com/siderolabs/go-loadbalancer/upstream"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/client-go/kubernetes"
@@ -22,6 +20,8 @@ import (
 	"github.com/lexfrei/extractedprism/internal/discovery/merged"
 	"github.com/lexfrei/extractedprism/internal/discovery/static"
 	"github.com/lexfrei/extractedprism/internal/health"
+	"github.com/lexfrei/extractedprism/internal/metrics"
+	"github.com/lexfrei/extractedprism/internal/proxy"
 )
 
 const (
@@ -119,12 +119,13 @@ func WithLivenessProbe(probe func()) Option {
 
 // Server ties together the load balancer, endpoint discovery, and health checking.
 type Server struct {
-	cfg        *config.Config
-	logger     *zap.Logger
-	lbHandle   *controlplane.LoadBalancer
-	healthSrv  healthServer
-	upstreamCh chan []string
-	kubeClient kubernetes.Interface
+	cfg         *config.Config
+	logger      *zap.Logger
+	proxyHandle *proxy.Proxy
+	metrics     *metrics.Metrics
+	healthSrv   healthServer
+	upstreamCh  chan []string
+	kubeClient  kubernetes.Interface
 
 	// Liveness heartbeat: the heartbeat goroutine periodically probes the
 	// load balancer and stores a timestamp. Alive() checks whether the
@@ -156,15 +157,24 @@ func New(cfg *config.Config, logger *zap.Logger, opts ...Option) (*Server, error
 		return nil, errors.Wrap(err, "invalid config")
 	}
 
-	lbHandle, err := createLoadBalancer(cfg, logger)
-	if err != nil {
-		return nil, err
-	}
+	metricsHandle := metrics.New()
+
+	proxyHandle := proxy.New(proxy.Config{
+		BindAddress:     cfg.BindAddress,
+		BindPort:        cfg.BindPort,
+		DialTimeout:     cfg.HealthTimeout,
+		KeepAlivePeriod: keepAlivePeriod,
+		TCPUserTimeout:  tcpUserTimeout,
+		HealthInterval:  cfg.HealthInterval,
+		HealthTimeout:   cfg.HealthTimeout,
+		DrainTimeout:    cfg.DrainTimeout,
+	}, logger, metricsHandle)
 
 	srv := &Server{
 		cfg:               cfg,
 		logger:            logger,
-		lbHandle:          lbHandle,
+		proxyHandle:       proxyHandle,
+		metrics:           metricsHandle,
 		upstreamCh:        make(chan []string, upstreamChBuffer),
 		heartbeatInterval: cfg.LivenessInterval,
 		livenessThreshold: cfg.LivenessThreshold,
@@ -175,41 +185,21 @@ func New(cfg *config.Config, logger *zap.Logger, opts ...Option) (*Server, error
 	}
 
 	if srv.probeFn == nil {
-		// The probe intentionally ignores errors from Healthy(). The liveness
-		// check only cares whether the LB goroutine can respond (not deadlocked).
-		// A degraded LB that returns errors is still "alive" — the readiness
+		// The probe discards the Healthy() result. Liveness only cares whether
+		// the proxy can answer at all (its state lock is not deadlocked); a
+		// proxy with no healthy upstreams is still "alive" — the readiness
 		// probe (/readyz) is responsible for signaling unhealthy upstreams.
 		srv.probeFn = func() {
-			_, _ = srv.lbHandle.Healthy()
+			_ = srv.proxyHandle.Healthy()
 		}
 	}
 
 	if srv.healthSrv == nil {
-		srv.healthSrv = health.NewServer(cfg.HealthBindAddress, cfg.HealthPort, srv, srv, logger)
+		srv.healthSrv = health.NewServer(cfg.HealthBindAddress, cfg.HealthPort, srv, srv, logger,
+			health.WithMetrics(srv.metrics.Handler()))
 	}
 
 	return srv, nil
-}
-
-func createLoadBalancer(
-	cfg *config.Config,
-	logger *zap.Logger,
-) (*controlplane.LoadBalancer, error) {
-	lbHandle, err := controlplane.NewLoadBalancer(
-		cfg.BindAddress, cfg.BindPort, logger,
-		controlplane.WithDialTimeout(cfg.HealthTimeout),
-		controlplane.WithKeepAlivePeriod(keepAlivePeriod),
-		controlplane.WithTCPUserTimeout(tcpUserTimeout),
-		controlplane.WithHealthCheckOptions(
-			upstream.WithHealthcheckInterval(cfg.HealthInterval),
-			upstream.WithHealthcheckTimeout(cfg.HealthTimeout),
-		),
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "create load balancer")
-	}
-
-	return lbHandle, nil
 }
 
 // Alive reports whether the server's Run loop is active and responsive.
@@ -232,40 +222,39 @@ func (srv *Server) Alive() bool {
 	return time.Since(time.Unix(0, last)) < srv.livenessThreshold
 }
 
-// Healthy delegates to the load balancer health status.
+// Healthy delegates to the proxy health status.
 func (srv *Server) Healthy() (bool, error) {
-	healthy, err := srv.lbHandle.Healthy()
-	if err != nil {
-		return false, errors.Wrap(err, "load balancer health check")
-	}
-
-	return healthy, nil
+	return srv.proxyHandle.Healthy(), nil
 }
 
 // Run starts all subsystems and blocks until ctx is cancelled.
 func (srv *Server) Run(ctx context.Context) error {
 	defer srv.lastHeartbeat.Store(0)
 
-	// Reset discoveryDone for correctness. Note: the underlying load balancer
-	// does not support re-Start after Shutdown, so Run cannot be called twice
-	// on the same Server instance in production. This reset ensures Alive()
-	// does not return a stale value from a prior call during tests or if the
-	// constraint is lifted in a future library version.
+	// Reset discoveryDone for correctness. Note: proxy.Shutdown runs at most
+	// once per instance, so a restarted proxy could never be shut down again;
+	// Run therefore cannot be called twice on the same Server instance in
+	// production. This reset ensures Alive() does not return a stale value
+	// from a prior call during tests.
 	srv.discoveryDone.Store(false)
 
 	// Mark alive before launching goroutines so the health server
 	// never sees lastHeartbeat == 0 during normal startup.
 	srv.lastHeartbeat.Store(time.Now().UnixNano())
 
-	err := srv.lbHandle.Start(srv.upstreamCh)
+	err := srv.proxyHandle.Start(ctx, srv.upstreamCh)
 	if err != nil {
-		return errors.Wrap(err, "start load balancer")
+		return errors.Wrap(err, "start proxy")
 	}
 
+	//nolint:contextcheck // parent ctx is done; fresh timeout needed for graceful shutdown
 	defer func() {
-		shutErr := srv.lbHandle.Shutdown()
+		shutCtx, shutCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer shutCancel()
+
+		shutErr := srv.proxyHandle.Shutdown(shutCtx)
 		if shutErr != nil {
-			srv.logger.Warn("load balancer shutdown error", zap.Error(shutErr))
+			srv.logger.Warn("proxy shutdown error", zap.Error(shutErr))
 		}
 	}()
 
@@ -341,8 +330,8 @@ func (srv *Server) runHeartbeat(ctx context.Context) error {
 // the goroutine is orphaned. This is an intentional tradeoff: a deadlocked
 // probe cannot be interrupted, so we accept a bounded leak (at most one
 // goroutine per heartbeat tick between cancellation and Run return).
-// The default probe (lbHandle.Healthy) is safe to call on a stopped load
-// balancer — it returns an error without side effects.
+// The default probe (proxyHandle.Healthy) is safe to call on a stopped
+// proxy: it only takes a read lock and has no side effects.
 func (srv *Server) probeWithContext(ctx context.Context) bool {
 	probeDone := make(chan struct{})
 
@@ -373,7 +362,7 @@ func (srv *Server) runDiscovery(ctx context.Context) error {
 		providers = built
 	}
 
-	mp := merged.NewMergedProvider(srv.logger, providers...)
+	mp := merged.NewMergedProvider(srv.logger, srv.metrics, providers...)
 
 	runErr := mp.Run(ctx, srv.upstreamCh)
 	if runErr != nil {
@@ -412,7 +401,9 @@ func (srv *Server) buildKubeProvider() (discovery.EndpointProvider, error) {
 
 	apiPort := ExtractAPIPort(srv.cfg.Endpoints)
 
-	return kubediscovery.NewProvider(client, srv.logger, apiPort), nil
+	countError := func() { srv.metrics.DiscoveryError(kubediscovery.ProviderName) }
+
+	return kubediscovery.NewProvider(client, srv.logger, apiPort, kubediscovery.WithErrorHook(countError)), nil
 }
 
 func (srv *Server) getKubeClient() (kubernetes.Interface, error) {

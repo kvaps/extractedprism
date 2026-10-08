@@ -58,6 +58,7 @@ func registerFlags() {
 	flags.String("log-level", base.LogLevel, "log level (debug, info, warn, error, dpanic, panic, fatal)")
 	flags.Duration("liveness-interval", base.LivenessInterval, "heartbeat probe interval for liveness detection")
 	flags.Duration("liveness-threshold", base.LivenessThreshold, "maximum time since last heartbeat before liveness fails")
+	flags.Duration("drain-timeout", base.DrainTimeout, "grace period for connections to removed endpoints before force close (0 = immediate)")
 }
 
 func bindEnvVars() {
@@ -76,6 +77,7 @@ func bindEnvVars() {
 	mustBindPFlag("log_level", flags.Lookup("log-level"))
 	mustBindPFlag("liveness_interval", flags.Lookup("liveness-interval"))
 	mustBindPFlag("liveness_threshold", flags.Lookup("liveness-threshold"))
+	mustBindPFlag("drain_timeout", flags.Lookup("drain-timeout"))
 
 	viper.AutomaticEnv()
 }
@@ -140,6 +142,7 @@ func buildConfig() *config.Config {
 	cfg.LogLevel = viper.GetString("log_level")
 	cfg.LivenessInterval = viper.GetDuration("liveness_interval")
 	cfg.LivenessThreshold = viper.GetDuration("liveness_threshold")
+	cfg.DrainTimeout = viper.GetDuration("drain_timeout")
 
 	return cfg
 }
