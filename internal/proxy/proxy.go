@@ -544,7 +544,7 @@ func (prx *Proxy) handleConn(client net.Conn) {
 		}
 
 		prx.recordFailure(bck, err)
-		prx.metrics.ConnError(bck.addr)
+		prx.connError(bck)
 		prx.logger.Warn("upstream dial failed",
 			zap.String("upstream", bck.addr), zap.Error(err))
 
@@ -566,7 +566,7 @@ func (prx *Proxy) serveConn(bck *backend, tconn *trackedConn) {
 		tconn.close()
 
 		if prx.ctx.Err() == nil {
-			prx.metrics.ConnError(bck.addr)
+			prx.connError(bck)
 		}
 
 		return
@@ -578,6 +578,22 @@ func (prx *Proxy) serveConn(bck *backend, tconn *trackedConn) {
 
 	prx.metrics.ConnClosed()
 	bck.unregister(tconn)
+}
+
+// connError records a failed connection while its address is in the set. The
+// series is per address, so a re-added address counts again. The read lock
+// spans the increment: removeBackend cannot delete the series in between, and
+// a late error cannot recreate it.
+func (prx *Proxy) connError(bck *backend) {
+	prx.mu.RLock()
+	defer prx.mu.RUnlock()
+
+	_, ok := prx.backends[bck.addr]
+	if !ok {
+		return
+	}
+
+	prx.metrics.ConnError(bck.addr)
 }
 
 // relay copies both directions until both have ended, then closes the

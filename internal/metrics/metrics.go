@@ -48,7 +48,7 @@ func New() *Metrics {
 		connErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "connection_errors_total",
-			Help:      "Connection errors by upstream, or \"none\" when no upstream was available. Failures caused by proxy shutdown are not counted.",
+			Help:      "Connection errors by upstream, or \"none\" when no upstream was available. Failures caused by proxy shutdown are not counted. The series of an upstream is deleted once it is drained and removed, and failures reported after that are not counted until the address is added again.",
 		}, []string{labelUpstream}),
 		discoveryUpdates: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace,
@@ -143,8 +143,9 @@ func (m *Metrics) SetBackendHealth(upstream string, healthy bool) {
 	m.backendHealth.WithLabelValues(upstream).Set(value)
 }
 
-// RemoveBackend deletes the health series of a removed upstream so stale
-// state is not exported after the upstream is gone.
+// RemoveBackend deletes the health and connection error series of a removed
+// upstream so dead series do not accumulate as endpoints change.
 func (m *Metrics) RemoveBackend(upstream string) {
 	m.backendHealth.DeleteLabelValues(upstream)
+	m.connErrors.DeleteLabelValues(upstream)
 }

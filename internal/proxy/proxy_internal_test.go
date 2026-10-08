@@ -375,3 +375,67 @@ func TestServeConn_RefusedByDrain_CountedAsConnError(t *testing.T) {
 	assert.Contains(t, body, `extractedprism_connection_errors_total{upstream="192.0.2.1:6443"} 1`,
 		"outside shutdown a refused registration still fails the client connection")
 }
+
+func TestRemoveBackend_DeletesConnErrorSeries(t *testing.T) {
+	prx := newTestProxy(t)
+	bck := newTestBackend("192.0.2.1:6443")
+	prx.backends[bck.addr] = bck
+	prx.metrics.ConnError(bck.addr)
+
+	_, _, gen := bck.startDrain()
+	prx.removeBackend(bck, gen)
+
+	body := scrapeInternal(t, prx.metrics)
+	assert.NotContains(t, body, "extractedprism_connection_errors_total{",
+		"a removed upstream must not keep its error series")
+}
+
+func TestServeConn_RefusedAfterRemoval_DoesNotRecreateConnErrorSeries(t *testing.T) {
+	prx := newTestProxy(t)
+	bck := newTestBackend("192.0.2.1:6443")
+	prx.backends[bck.addr] = bck
+
+	// The dial finished while the backend drained and was removed.
+	_, _, gen := bck.startDrain()
+	prx.removeBackend(bck, gen)
+
+	client, clientPeer := net.Pipe()
+	upstream, upstreamPeer := net.Pipe()
+
+	t.Cleanup(func() {
+		clientPeer.Close()
+		upstreamPeer.Close()
+	})
+
+	prx.serveConn(bck, &trackedConn{client: client, upstream: upstream})
+
+	body := scrapeInternal(t, prx.metrics)
+	assert.NotContains(t, body, "extractedprism_connection_errors_total{",
+		"a late error for a removed upstream must not recreate its series")
+}
+
+func TestServeConn_RefusedAfterReAdd_CountsOnLiveSeries(t *testing.T) {
+	prx := newTestProxy(t)
+	stale := newTestBackend("192.0.2.1:6443")
+	prx.backends[stale.addr] = stale
+
+	// The dial finished on a backend that was removed and then re-added
+	// under the same address as a new backend.
+	_, _, gen := stale.startDrain()
+	prx.removeBackend(stale, gen)
+	prx.backends[stale.addr] = newTestBackend(stale.addr)
+
+	client, clientPeer := net.Pipe()
+	upstream, upstreamPeer := net.Pipe()
+
+	t.Cleanup(func() {
+		clientPeer.Close()
+		upstreamPeer.Close()
+	})
+
+	prx.serveConn(stale, &trackedConn{client: client, upstream: upstream})
+
+	body := scrapeInternal(t, prx.metrics)
+	assert.Contains(t, body, `extractedprism_connection_errors_total{upstream="192.0.2.1:6443"} 1`,
+		"the address is back in the set, so its series is live and the failure counts")
+}

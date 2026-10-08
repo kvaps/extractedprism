@@ -97,6 +97,19 @@ func TestRemoveBackend_DeletesHealthSeries(t *testing.T) {
 	assert.NotContains(t, body, "extractedprism_health_check_status{")
 }
 
+func TestRemoveBackend_DeletesConnErrorSeries(t *testing.T) {
+	m := metrics.New()
+
+	m.ConnError("192.0.2.1:6443")
+	m.ConnError("192.0.2.2:6443")
+	m.RemoveBackend("192.0.2.1:6443")
+
+	body := scrape(t, m)
+	assert.NotContains(t, body, `extractedprism_connection_errors_total{upstream="192.0.2.1:6443"}`)
+	assert.Contains(t, body, `extractedprism_connection_errors_total{upstream="192.0.2.2:6443"} 1`,
+		"other upstreams keep their series")
+}
+
 func TestNew_IsolatedRegistries(t *testing.T) {
 	// Two instances must not share state: no cross-talk and no duplicate
 	// registration panic on the default registry.
