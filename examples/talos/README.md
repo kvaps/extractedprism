@@ -1,22 +1,22 @@
 # Running extractedprism on Talos Linux
 
-Talos Linux ships its own per-node API load balancer, **KubePrism**, bound to `localhost:7445`. KubePrism builds its backend list from Talos *cluster discovery*. On current Kubernetes that discovery is constrained:
+Talos Linux ships its own per-node API load balancer, **KubePrism**, on `localhost:7445`. This example replaces it with extractedprism fed by a static endpoint list, so the load balancer does not depend on Talos cluster discovery ([Talos docs: Discovery](https://docs.siderolabs.com/talos/v1.12/configure-your-talos-cluster/system-configuration/discovery)).
 
-> The Kubernetes registry is deprecated. Starting with Kubernetes 1.32, the `AuthorizeNodeWithSelectors` feature gate restricts `Node` resource read access in a way that prevents the Kubernetes registry from functioning correctly.
->
-> — [Talos docs: Discovery](https://docs.siderolabs.com/talos/v1.14/configure-your-talos-cluster/system-configuration/discovery)
+> Validated on a 5-node Talos v1.12 control plane: the runtime swap and a cold reboot both keep the node `Ready` through extractedprism; kubelet reaches the API server via `localhost:7445` from boot, with no restarts. Worker nodes were not part of that test.
 
-The Kubernetes registry stored discovery data in `Node` annotations and relied on every node reading its peers' `Node` objects; the new Node authorizer blocks that. The only remaining Talos registry is the **service** registry (`discovery.talos.dev`), which sends per-node metadata outside the cluster and adds an external runtime dependency.
-
-extractedprism replaces KubePrism with the same local TCP load balancer, fed by a **static, self-contained endpoint list** — no cluster discovery, nothing leaving the network.
-
-> Validated on a 5-node Talos v1.12 control plane: the runtime swap and a cold reboot both keep the node `Ready` through extractedprism; kubelet reaches the API server via `localhost:7445` from boot, with no restarts.
+The example uses the `v1alpha1` machine config format of that release. Machine configs with a newer config contract move some of these settings into separate documents, so adapt it to the [Talos configuration reference](https://docs.siderolabs.com/talos/v1.12/reference/configuration/overview) of your version.
 
 ## Configuration
 
 Run extractedprism as a **static pod** (`machine.pods`), not a DaemonSet. On Talos the static pod is started by the kubelet directly from the machine config, so it comes up without the API server or CNI — which is exactly what the kubelet then needs in order to bootstrap. Point the single cluster endpoint at it and disable the built-in KubePrism (both bind `localhost:7445`).
 
-See [`machine-config-patch.yaml`](./machine-config-patch.yaml). Replace the `--endpoints` list with your control-plane node IPs.
+See [`machine-config-patch.yaml`](./machine-config-patch.yaml). Replace the `--endpoints` list with your control-plane node IPs. Kubernetes discovery is turned off with `--enable-discovery=false`: a static pod gets no ServiceAccount token, so the in-cluster client cannot be built, and the static list is the whole source of endpoints.
+
+### Disabling KubePrism
+
+Both bind `localhost:7445`, so KubePrism must be off. The example sets `machine.features.kubePrism.enabled: false`.
+
+### Cilium
 
 If you run Cilium as the kube-proxy replacement, point it at the same endpoint:
 
@@ -37,7 +37,7 @@ Deliver this through your machine config template and a full `apply-config`. A T
 
 1. kubelet starts and reads the static pod manifest from the machine config.
 2. extractedprism comes up on `localhost:7445` (`hostNetwork`, no CNI needed) and proxies to a healthy control plane from the static list.
-3. kubelet, kube-scheduler and kube-controller-manager reach the API through `cluster.controlPlane.endpoint = https://localhost:7445`. They retry until the proxy is ready, so the brief startup race is self-healing.
+3. kubelet reaches the API through `cluster.controlPlane.endpoint = https://localhost:7445` and retries until the proxy is ready, so the brief startup race is self-healing.
 4. CNI starts and uses `localhost:7445` as well.
 
 The container image must be available to the container runtime at boot. A normal reboot keeps it in the containerd cache; for a node wiped back to a clean state, mirror the image in a registry the node can reach at boot (or pre-load it) so the static pod can start before the API server is up.
